@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo test --workspace --all-features --locked
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - run: cargo package --locked -p a3s-use-browser
+
+  platform-test:
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --locked --no-run
+      - name: Run workspace tests
+        if: runner.os != 'Windows'
+        run: cargo test --workspace --locked
+      - name: Run Browser library tests
+        if: runner.os == 'Windows'
+        run: cargo test -p a3s-use-browser --locked
+      - name: Run Browser driver tests
+        if: runner.os == 'Windows'
+        run: cargo test -p a3s-use-browser-driver --locked
+
+  dashboard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: crates/browser-driver/dashboard/pnpm-lock.yaml
+      - run: pnpm --dir crates/browser-driver/dashboard install --frozen-lockfile
+      - run: pnpm --dir crates/browser-driver/dashboard build
+      - run: test -f crates/browser-driver/dashboard/out/index.html
+
+  browser-032-e2e:
+    name: Browser 0.32 regressions (${{ matrix.os }})
+    if: github.event_name != 'pull_request'
+    timeout-minutes: 45
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Configure isolated Browser paths
+        shell: bash
+        run: |
+          echo "A3S_USE_BROWSER_HOME=${RUNNER_TEMP}/a3s-use-browser" >> "${GITHUB_ENV}"
+          echo "A3S_USE_BROWSER_RUNTIME_DIR=${RUNNER_TEMP}/a3s-use-browser-runtime" >> "${GITHUB_ENV}"
+      - name: Install managed Chrome
+        run: cargo run --locked -p a3s-use-browser --example install_chrome
+      - name: Run domain-containment regressions
+        run: cargo test -p a3s-use-browser-driver --locked e2e_domain_filter_blocks_ -- --ignored --test-threads=1
+      - name: Run completed-page lifecycle regression
+        run: cargo test -p a3s-use-browser-driver --locked e2e_wait_load_state_resolves_immediately_when_already_loaded -- --ignored --test-threads=1

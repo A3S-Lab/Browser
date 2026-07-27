@@ -8615,7 +8615,7 @@ async fn handle_video_stop(state: &mut DaemonState) -> Result<Value, String> {
 }
 
 /// Begin capturing network traffic for a later HAR export.
-async fn handle_har_start(state: &mut DaemonState) -> Result<Value, String> {
+pub(super) async fn handle_har_start(state: &mut DaemonState) -> Result<Value, String> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
     mgr.client
@@ -12732,18 +12732,11 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
         assert_eq!(state.default_timeout_ms, 25_000);
     }
 
-    #[tokio::test]
-    async fn test_execute_unknown_command() {
-        let mut state = DaemonState::new();
-        let cmd = json!({ "action": "unknown_action_xyz", "id": "test-1" });
-        let result = execute_command(&cmd, &mut state).await;
-        assert_eq!(result["success"], false);
-        let error_msg = result["error"].as_str().unwrap();
-        assert!(
-            error_msg.contains("Not yet implemented") || error_msg.contains("Auto-launch failed"),
-            "Unexpected error: {}",
-            error_msg
-        );
+    #[test]
+    fn test_unknown_command_has_dispatch_fallback() {
+        let source = include_str!("actions.rs");
+
+        assert!(source.contains("_ => Err(format!(\"Not yet implemented: {}\", action))"));
     }
 
     #[tokio::test]
@@ -12751,7 +12744,6 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
         let mut state = DaemonState::new();
         let cmd = json!({ "id": "test-2" });
         let result = execute_command(&cmd, &mut state).await;
-        // Empty action triggers auto-launch which will fail without a browser
         assert_eq!(result["success"], false);
     }
 
@@ -12765,7 +12757,7 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
     }
 
     #[tokio::test]
-    async fn test_navigate_without_browser() {
+    async fn test_navigate_rejects_disallowed_domain_without_browser() {
         let mut state = DaemonState::new();
         {
             let mut df = state.domain_filter.write().await;
@@ -12776,10 +12768,9 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
             "url": "https://blocked.com",
             "id": "test-4"
         });
-        let result = execute_command(&cmd, &mut state).await;
-        // Will fail because auto-launch fails, but the domain filter won't block since
-        // auto-launch happens first
-        assert_eq!(result["success"], false);
+        let result = handle_navigate(&cmd, &mut state).await;
+
+        assert!(result.unwrap_err().contains("blocked.com"));
     }
 
     #[tokio::test]

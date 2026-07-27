@@ -151,6 +151,7 @@ fn cleanup_restore_state_files(restore_key: &str) {
     }
 }
 
+#[cfg(unix)]
 async fn send_raw_http_request(port: u64, request: &str) -> String {
     let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
         .await

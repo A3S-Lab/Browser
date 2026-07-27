@@ -2,7 +2,7 @@ use serde_json::Value;
 use std::env;
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
 use std::time::Duration;
@@ -167,7 +167,7 @@ fn autosave_interval_ms_from_env() -> u64 {
 
 #[cfg(unix)]
 async fn run_socket_server(
-    socket_path: &PathBuf,
+    socket_path: &Path,
     session: &str,
     stream_client: Option<Arc<RwLock<Option<Arc<CdpClient>>>>>,
     stream_server: Option<Arc<StreamServer>>,
@@ -279,7 +279,7 @@ async fn run_socket_server(
 
 #[cfg(windows)]
 async fn run_socket_server(
-    socket_path: &PathBuf,
+    socket_path: &Path,
     session: &str,
     stream_client: Option<Arc<RwLock<Option<Arc<CdpClient>>>>>,
     stream_server: Option<Arc<StreamServer>>,
@@ -358,7 +358,7 @@ async fn run_socket_server(
                 if process_exited {
                     let _ = close_current_browser(&mut s).await;
                 } else if s.browser.is_some() {
-                    s.drain_cdp_events_background().await;
+                    let _ = s.drain_cdp_events_background().await;
                     maybe_autosave_restore_state(&mut s, autosave_interval_ms).await;
                 }
             }

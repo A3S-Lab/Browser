@@ -1,6 +1,4 @@
-#[cfg(not(feature = "chrome"))]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,6 +8,14 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 pub use a3s_use_core::{UseError, UseResult};
+
+/// Source-tree root of the Browser driver and its packaged assets.
+///
+/// Installed products should use release-packaged paths. This is a development
+/// fallback for hosts consuming the complete Browser repository through Git.
+pub fn source_driver_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../browser-driver")
+}
 
 #[cfg(feature = "chrome")]
 mod chrome;

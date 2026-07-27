@@ -146,6 +146,7 @@ pub(super) fn check(checks: &mut Vec<Check>, opts: &DoctorOptions) {
         "a3s-use-browser-doctor-webgpu-{}",
         uuid::Uuid::new_v4()
     ));
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut dir_builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
     {

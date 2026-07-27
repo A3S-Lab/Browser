@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "crates/browser",
+    "crates/browser-driver",
+]
+resolver = "2"

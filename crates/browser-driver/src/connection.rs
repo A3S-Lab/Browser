@@ -206,6 +206,7 @@ pub enum CleanReason {
     /// The `.pid` file could not be parsed as a PID.
     UnreadablePidFile,
     /// A `.sock` file had no corresponding `.pid` file (unix only).
+    #[cfg(unix)]
     OrphanedSocket,
     /// The `dashboard.pid` referenced a process that no longer exists.
     DashboardGone,
@@ -368,7 +369,7 @@ pub fn get_port_for_session(session: &str) -> u16 {
     }
     // Correct logic: first take absolute modulo, then cast to u16
     // Using unsigned_abs() to safely handle i32::MIN
-    49152 + ((hash.unsigned_abs() as u32 % 16383) as u16)
+    49152 + ((hash.unsigned_abs() % 16383) as u16)
 }
 
 /// Read the actual daemon port from the `.port` file written by the daemon.

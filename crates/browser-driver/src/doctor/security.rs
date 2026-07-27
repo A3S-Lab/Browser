@@ -38,8 +38,11 @@ pub(super) fn check(checks: &mut Vec<Check>) {
             );
         }
     } else if key_file.exists() {
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut msg = format!("Encryption key file present: {}", key_file.display());
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut status = Status::Pass;
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut fix: Option<String> = None;
         #[cfg(unix)]
         if let Ok(meta) = fs::metadata(&key_file) {
