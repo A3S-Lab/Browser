@@ -679,6 +679,7 @@ mod tests {
     #[cfg(not(windows))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn discovered_chrome_keeps_typed_session_state_when_available() {
+        let _guard = crate::test_support::lock_chrome_integration_test().await;
         let Some(executable) = crate::detect_chrome() else {
             return;
         };
@@ -709,7 +710,7 @@ mod tests {
                 .open(OpenSessionRequest {
                     session: session.clone(),
                     url: Url::parse(&format!("http://{address}/fixture")).unwrap(),
-                    timeout_ms: 10_000,
+                    timeout_ms: crate::test_support::CHROME_OPERATION_TIMEOUT_MS,
                     wait: WaitCondition::Load,
                     user_agent: None,
                 })
