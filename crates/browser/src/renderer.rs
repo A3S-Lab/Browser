@@ -198,6 +198,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn discovered_chrome_renders_a_network_free_page_when_available() {
+        let _guard = crate::test_support::lock_chrome_integration_test().await;
         let Some(executable) = crate::detect_chrome() else {
             return;
         };
@@ -207,7 +208,7 @@ mod tests {
         });
         let request = RenderRequest {
             url: Url::parse("data:text/html,<main id='fixture'>a3s-use</main>").unwrap(),
-            timeout_ms: 10_000,
+            timeout_ms: crate::test_support::CHROME_OPERATION_TIMEOUT_MS,
             wait: WaitCondition::Load,
             user_agent: Some("a3s-use-browser-test".to_string()),
             screenshot_path: None,

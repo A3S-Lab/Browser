@@ -10,6 +10,10 @@ pub struct ChromeProcess {
     child: Child,
     pub ws_url: String,
     temp_user_data_dir: Option<PathBuf>,
+    /// Whether the Windows launcher exited after handing the browser process
+    /// to a child. Only this case may treat a successful child status as live.
+    #[cfg(windows)]
+    launcher_handed_off: bool,
     /// On Unix, the process group ID used to kill the entire Chrome process tree.
     #[cfg(unix)]
     pgid: Option<i32>,
@@ -43,7 +47,13 @@ impl ChromeProcess {
     /// Non-blocking check whether Chrome has exited.
     /// Returns `true` if the process has exited (and reaps it), `false` if still running.
     pub fn has_exited(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(Some(_)) | Err(_))
+        match self.child.try_wait() {
+            #[cfg(windows)]
+            Ok(Some(status)) if status.success() && self.launcher_handed_off => false,
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(_) => true,
+        }
     }
 
     /// Wait for Chrome to exit on its own (after Browser.close CDP command),
@@ -681,29 +691,32 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
     // Primary path: use DevToolsActivePort written into user-data-dir.
     // This is more reliable on Windows than scraping stderr for "DevTools listening on ...",
     // which can be missing/empty depending on how Chrome is launched.
-    let ws_url = match wait_for_devtools_active_port(&mut child, &user_data_dir, deadline) {
-        Ok(url) => url,
-        Err(primary_err) => {
-            // Fallback: scrape stderr (legacy behavior) for better diagnostics.
-            let stderr = child.stderr.take().ok_or_else(|| {
-                let _ = child.kill();
-                cleanup_temp_dir(&temp_user_data_dir);
-                "Failed to capture Chrome stderr".to_string()
-            })?;
-            let reader = BufReader::new(stderr);
-            match wait_for_ws_url_until(reader, deadline) {
-                Ok(url) => url,
-                Err(fallback_err) => {
+    let (ws_url, launcher_handed_off) =
+        match wait_for_devtools_active_port(&mut child, &user_data_dir, deadline) {
+            Ok(endpoint) => endpoint,
+            Err(primary_err) => {
+                // Fallback: scrape stderr (legacy behavior) for better diagnostics.
+                let stderr = child.stderr.take().ok_or_else(|| {
                     let _ = child.kill();
                     cleanup_temp_dir(&temp_user_data_dir);
-                    return Err(format!(
-                        "{}\n(also tried parsing stderr) {}",
-                        primary_err, fallback_err
-                    ));
+                    "Failed to capture Chrome stderr".to_string()
+                })?;
+                let reader = BufReader::new(stderr);
+                match wait_for_ws_url_until(reader, deadline) {
+                    Ok(url) => (url, successful_windows_launcher_exit(&mut child)),
+                    Err(fallback_err) => {
+                        let _ = child.kill();
+                        cleanup_temp_dir(&temp_user_data_dir);
+                        return Err(format!(
+                            "{}\n(also tried parsing stderr) {}",
+                            primary_err, fallback_err
+                        ));
+                    }
                 }
             }
-        }
-    };
+        };
+    #[cfg(not(windows))]
+    let _ = launcher_handed_off;
 
     #[cfg(unix)]
     let pgid = {
@@ -717,6 +730,8 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
         child,
         ws_url,
         temp_user_data_dir,
+        #[cfg(windows)]
+        launcher_handed_off,
         #[cfg(unix)]
         pgid,
         #[cfg(target_os = "linux")]
@@ -728,32 +743,74 @@ fn wait_for_devtools_active_port(
     child: &mut Child,
     user_data_dir: &Path,
     deadline: std::time::Instant,
-) -> Result<String, String> {
+) -> Result<(String, bool), String> {
     let poll_interval = Duration::from_millis(50);
+    #[cfg(windows)]
+    let mut successful_launcher_exit_at = None;
 
     while std::time::Instant::now() <= deadline {
+        if let Some((port, ws_path)) = read_devtools_active_port(user_data_dir) {
+            let ws_url = format!("ws://127.0.0.1:{}{}", port, ws_path);
+            let launcher_handed_off = {
+                #[cfg(windows)]
+                {
+                    successful_launcher_exit_at.is_some() || successful_windows_launcher_exit(child)
+                }
+                #[cfg(not(windows))]
+                {
+                    false
+                }
+            };
+            return Ok((ws_url, launcher_handed_off));
+        }
+
         if let Ok(Some(status)) = child.try_wait() {
-            // Chrome exited before writing DevToolsActivePort -- report the
-            // exit code so the caller can surface it alongside stderr output.
             let code = status
                 .code()
                 .map(|c| format!("{}", c))
                 .unwrap_or_else(|| "unknown".to_string());
+
+            #[cfg(windows)]
+            if status.success() {
+                // Edge may hand the browser process to a child and let its
+                // launcher exit successfully before DevToolsActivePort is
+                // published. Keep polling for a bounded grace period.
+                let exited_at =
+                    successful_launcher_exit_at.get_or_insert_with(std::time::Instant::now);
+                if exited_at.elapsed() >= Duration::from_secs(5) {
+                    return Err(format!(
+                        "Chrome launcher exited successfully but no browser published \
+                         DevToolsActivePort within 5 seconds (exit code: {code})"
+                    ));
+                }
+            } else {
+                return Err(format!(
+                    "Chrome exited early (exit code: {}) without writing DevToolsActivePort",
+                    code
+                ));
+            }
+
+            #[cfg(not(windows))]
             return Err(format!(
                 "Chrome exited early (exit code: {}) without writing DevToolsActivePort",
                 code
             ));
         }
 
-        if let Some((port, ws_path)) = read_devtools_active_port(user_data_dir) {
-            let ws_url = format!("ws://127.0.0.1:{}{}", port, ws_path);
-            return Ok(ws_url);
-        }
-
         std::thread::sleep(poll_interval);
     }
 
     Err("Timeout waiting for DevToolsActivePort".to_string())
+}
+
+#[cfg(windows)]
+fn successful_windows_launcher_exit(child: &mut Child) -> bool {
+    matches!(child.try_wait(), Ok(Some(status)) if status.success())
+}
+
+#[cfg(not(windows))]
+fn successful_windows_launcher_exit(_child: &mut Child) -> bool {
+    false
 }
 
 fn wait_for_ws_url_until(
@@ -1677,6 +1734,64 @@ mod tests {
         assert!(result.is_none());
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn test_wait_for_devtools_accepts_successful_windows_launcher_handoff() {
+        let profile = tempfile::tempdir().unwrap();
+        let active_port = profile.path().join("DevToolsActivePort");
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            std::fs::write(
+                active_port,
+                "43210\n/devtools/browser/windows-launcher-handoff\n",
+            )
+            .unwrap();
+        });
+        let mut child = spawn_noop_child();
+
+        let result = wait_for_devtools_active_port(
+            &mut child,
+            profile.path(),
+            std::time::Instant::now() + Duration::from_secs(2),
+        );
+
+        writer.join().unwrap();
+        let (url, launcher_handed_off) = result.unwrap();
+        assert_eq!(
+            url,
+            "ws://127.0.0.1:43210/devtools/browser/windows-launcher-handoff"
+        );
+        assert!(launcher_handed_off);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_successful_windows_launcher_exit_is_not_a_browser_crash() {
+        let mut process = ChromeProcess {
+            child: spawn_noop_child(),
+            ws_url: String::new(),
+            temp_user_data_dir: None,
+            launcher_handed_off: true,
+        };
+        std::thread::sleep(Duration::from_millis(100));
+
+        assert!(!process.has_exited());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_successful_windows_browser_exit_is_detected_without_handoff() {
+        let mut process = ChromeProcess {
+            child: spawn_noop_child(),
+            ws_url: String::new(),
+            temp_user_data_dir: None,
+            launcher_handed_off: false,
+        };
+        std::thread::sleep(Duration::from_millis(100));
+
+        assert!(process.has_exited());
+    }
+
     #[test]
     fn test_should_disable_sandbox_skips_if_already_set() {
         let args = vec!["--headless=new".to_string(), "--no-sandbox".to_string()];
@@ -2152,6 +2267,8 @@ mod tests {
                 child,
                 ws_url: String::new(),
                 temp_user_data_dir: Some(dir.clone()),
+                #[cfg(windows)]
+                launcher_handed_off: false,
                 #[cfg(unix)]
                 pgid: None,
                 #[cfg(target_os = "linux")]

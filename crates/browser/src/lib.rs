@@ -34,6 +34,20 @@ mod renderer;
 #[cfg(feature = "chrome")]
 mod session;
 
+#[cfg(all(test, feature = "chrome", not(windows)))]
+mod test_support {
+    use std::sync::OnceLock;
+
+    use tokio::sync::{Mutex, MutexGuard};
+
+    pub(crate) const CHROME_OPERATION_TIMEOUT_MS: u64 = 30_000;
+
+    pub(crate) async fn lock_chrome_integration_test() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().await
+    }
+}
+
 #[cfg(feature = "lightpanda")]
 mod lightpanda;
 
