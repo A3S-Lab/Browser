@@ -1,6 +1,6 @@
 [package]
 name = "a3s-use-browser-driver"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 description = "Full browser automation driver for A3S"
 license = "Apache-2.0"

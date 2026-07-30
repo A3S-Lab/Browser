@@ -1,4 +1,4 @@
-//! Chromiumoxide-backed Browser provider lifecycle.
+//! Browser provider lifecycle for Chrome and Lightpanda.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -19,7 +19,7 @@ pub enum BrowserBackend {
     #[default]
     Chrome,
 
-    /// Spawn a Lightpanda process and connect via CDP over WebSocket.
+    /// Use Lightpanda command rendering and CDP-backed interactive sessions.
     #[cfg(feature = "lightpanda")]
     Lightpanda,
 }
@@ -87,10 +87,11 @@ impl Default for BrowserPoolConfig {
     }
 }
 
-/// A shared pool managing a single browser process with tab concurrency control.
+/// A shared pool with bounded rendering and tab concurrency.
 ///
-/// The browser is lazily launched on the first `acquire_browser()` call.
-/// A semaphore limits the number of concurrent tabs to prevent memory exhaustion.
+/// Chrome and interactive sessions lazily launch a reusable browser process.
+/// Lightpanda page rendering uses its bounded `fetch` process because its partial
+/// CDP implementation is not compatible with Chromiumoxide's navigation lifecycle.
 pub struct BrowserPool {
     config: BrowserPoolConfig,
     chrome_profile_dir: std::path::PathBuf,
@@ -127,6 +128,35 @@ impl BrowserPool {
     /// Returns the tab semaphore for acquiring permits before opening tabs.
     pub(crate) fn tab_semaphore(&self) -> &Arc<Semaphore> {
         &self.tab_semaphore
+    }
+
+    #[cfg(feature = "lightpanda")]
+    pub(crate) fn uses_lightpanda(&self) -> bool {
+        self.config.provider.backend() == BrowserBackend::Lightpanda
+    }
+
+    #[cfg(feature = "lightpanda")]
+    pub(crate) fn ensure_open(&self) -> UseResult<()> {
+        (!self.closed.load(Ordering::Acquire))
+            .then_some(())
+            .ok_or_else(|| browser_error("Browser pool has already been shut down".to_string()))
+    }
+
+    #[cfg(feature = "lightpanda")]
+    pub(crate) fn lightpanda_proxy_url(&self) -> Option<&str> {
+        self.config.proxy_url.as_deref()
+    }
+
+    #[cfg(feature = "lightpanda")]
+    pub(crate) async fn lightpanda_executable(&self) -> UseResult<std::path::PathBuf> {
+        match &self.config.provider {
+            BrowserProvider::DiscoveredLightpanda => crate::lightpanda::resolve_lightpanda(),
+            BrowserProvider::ManagedLightpanda => crate::lightpanda::ensure_lightpanda().await,
+            BrowserProvider::LightpandaExecutable(path) => Ok(path.clone()),
+            _ => Err(browser_error(
+                "The selected provider is not Lightpanda-compatible.",
+            )),
+        }
     }
 
     /// Returns the number of tabs that may be opened immediately.
@@ -253,16 +283,7 @@ impl BrowserPool {
 
         debug!("Launching Lightpanda browser");
 
-        let lp_path = match &self.config.provider {
-            BrowserProvider::DiscoveredLightpanda => crate::lightpanda::resolve_lightpanda()?,
-            BrowserProvider::ManagedLightpanda => crate::lightpanda::ensure_lightpanda().await?,
-            BrowserProvider::LightpandaExecutable(path) => path.clone(),
-            _ => {
-                return Err(browser_error(
-                    "The selected provider is not Lightpanda-compatible.",
-                ))
-            }
-        };
+        let lp_path = self.lightpanda_executable().await?;
 
         let port = find_free_port()?;
 
