@@ -45,7 +45,11 @@ assert_eq!(page.status, Some(200));
 Provider selection remains typed. The default embedded provider discovers a
 local Chrome-compatible browser and can use the bounded managed cache. The
 optional `lightpanda` feature enables the separately managed Lightpanda
-provider.
+provider. Lightpanda discovery also recognizes the historical
+`~/.a3s/lightpanda/<version>/lightpanda` layout used by A3S Search before the
+Browser repository was split out. Historical runtimes are treated as external,
+read-only installations; Browser only updates or removes installs in its
+receipt-backed managed data root.
 
 ## Build
 
