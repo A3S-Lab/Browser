@@ -37,7 +37,7 @@ let browser = BrowserRuntime::new(renderer);
 let page = browser
     .render(RenderRequest::new(Url::parse("https://example.com").unwrap()))
     .await?;
-assert_eq!(page.status, Some(200));
+assert!(!page.html.is_empty());
 # Ok(())
 # }
 ```
@@ -50,6 +50,14 @@ provider. Lightpanda discovery also recognizes the historical
 Browser repository was split out. Historical runtimes are treated as external,
 read-only installations; Browser only updates or removes installs in its
 receipt-backed managed data root.
+
+Lightpanda HTML rendering uses its bounded `fetch` command instead of assuming
+full Chromium CDP lifecycle compatibility. Every render shares one deadline
+across provider resolution, queueing, navigation, output collection, and
+optional post-fetch waiting. Timeout or caller cancellation schedules bounded
+process cleanup so the provider child is killed and reaped. Exact user-agent
+overrides, selector waits, and screenshots remain Chrome-only capabilities and
+fail explicitly when requested from the Lightpanda renderer.
 
 ## Build
 

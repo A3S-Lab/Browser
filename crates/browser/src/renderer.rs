@@ -15,6 +15,11 @@ use crate::{PageRenderer, RenderRequest, RenderedPage, WaitCondition};
 #[async_trait]
 impl PageRenderer for BrowserPool {
     async fn render(&self, request: RenderRequest) -> UseResult<RenderedPage> {
+        #[cfg(feature = "lightpanda")]
+        if self.uses_lightpanda() {
+            return self.render_with_lightpanda(request).await;
+        }
+
         let timeout = request.timeout();
         match tokio::time::timeout(timeout, self.render_inner(request)).await {
             Ok(result) => result,
@@ -195,6 +200,236 @@ impl Drop for PageGuard {
 mod tests {
     use super::*;
     use crate::{BrowserPoolConfig, BrowserProvider};
+    #[cfg(feature = "lightpanda")]
+    use std::sync::Arc;
+
+    #[cfg(feature = "lightpanda")]
+    fn executable_fixture(contents: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("lightpanda");
+        std::fs::write(&executable, contents).unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+        (directory, executable)
+    }
+
+    #[cfg(feature = "lightpanda")]
+    #[tokio::test]
+    async fn lightpanda_renderer_uses_the_fetch_command_for_html() {
+        let (_directory, executable) = executable_fixture(
+            "#!/bin/sh\nprintf '<!DOCTYPE html><html><body>cli fixture</body></html>'\n",
+        );
+        let pool = BrowserPool::new(BrowserPoolConfig {
+            provider: BrowserProvider::LightpandaExecutable(executable),
+            ..BrowserPoolConfig::default()
+        });
+        let request = RenderRequest {
+            url: Url::parse("https://example.test/search?q=rust").unwrap(),
+            timeout_ms: 5_000,
+            wait: WaitCondition::Load,
+            user_agent: None,
+            screenshot_path: None,
+        };
+
+        let rendered = pool.render(request).await;
+        pool.shutdown().await;
+
+        let rendered = rendered.unwrap();
+        assert!(rendered.html.contains("cli fixture"));
+        assert_eq!(rendered.content_type.as_deref(), Some("text/html"));
+    }
+
+    #[cfg(feature = "lightpanda")]
+    #[tokio::test]
+    async fn lightpanda_renderer_forwards_url_deadline_and_proxy_as_arguments() {
+        let directory = tempfile::tempdir().unwrap();
+        let arguments = directory.path().join("arguments.txt");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '<html>arguments fixture</html>'\n",
+            arguments.display()
+        );
+        let (_executable_directory, executable) = executable_fixture(&script);
+        let proxy = "http://user:secret@proxy.example:8080";
+        let pool = BrowserPool::new(BrowserPoolConfig {
+            provider: BrowserProvider::LightpandaExecutable(executable),
+            proxy_url: Some(proxy.to_string()),
+            ..BrowserPoolConfig::default()
+        });
+        let request = RenderRequest {
+            url: Url::parse("https://example.test/search?q=rust").unwrap(),
+            timeout_ms: 5_000,
+            wait: WaitCondition::Load,
+            user_agent: None,
+            screenshot_path: None,
+        };
+
+        pool.render(request).await.unwrap();
+        pool.shutdown().await;
+
+        let arguments = std::fs::read_to_string(arguments).unwrap();
+        assert!(arguments.contains("fetch\n"));
+        assert!(arguments.contains("--dump\nhtml\n"));
+        assert!(arguments.contains("--http_connect_timeout\n5000\n"));
+        assert!(arguments.contains("--http_timeout\n5000\n"));
+        assert!(arguments.contains(&format!("--http_proxy\n{proxy}\n")));
+        assert!(arguments.ends_with("https://example.test/search?q=rust\n"));
+    }
+
+    #[cfg(feature = "lightpanda")]
+    #[tokio::test]
+    async fn lightpanda_renderer_kills_and_reaps_a_timed_out_fetch() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid_file = directory.path().join("pid.txt");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\nexec sleep 30\n",
+            pid_file.display()
+        );
+        let (_executable_directory, executable) = executable_fixture(&script);
+        let pool = BrowserPool::new(BrowserPoolConfig {
+            provider: BrowserProvider::LightpandaExecutable(executable),
+            ..BrowserPoolConfig::default()
+        });
+        let request = RenderRequest {
+            url: Url::parse("https://example.test/").unwrap(),
+            timeout_ms: 2_000,
+            wait: WaitCondition::Load,
+            user_agent: None,
+            screenshot_path: None,
+        };
+
+        let error = pool.render(request).await.unwrap_err();
+        pool.shutdown().await;
+
+        assert_eq!(error.code, "use.browser.timeout");
+        let pid = std::fs::read_to_string(pid_file).unwrap();
+        let still_running = std::process::Command::new("kill")
+            .args(["-0", pid.trim()])
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(
+            !still_running,
+            "timed-out Lightpanda process {pid} survived"
+        );
+    }
+
+    #[cfg(feature = "lightpanda")]
+    #[tokio::test]
+    async fn cancelling_lightpanda_render_still_kills_and_reaps_the_fetch() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid_file = directory.path().join("cancelled-pid.txt");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\nexec sleep 30\n",
+            pid_file.display()
+        );
+        let (_executable_directory, executable) = executable_fixture(&script);
+        let pool = Arc::new(BrowserPool::new(BrowserPoolConfig {
+            provider: BrowserProvider::LightpandaExecutable(executable),
+            ..BrowserPoolConfig::default()
+        }));
+        let request = RenderRequest {
+            url: Url::parse("https://example.test/").unwrap(),
+            timeout_ms: 30_000,
+            wait: WaitCondition::Load,
+            user_agent: None,
+            screenshot_path: None,
+        };
+        let render_pool = Arc::clone(&pool);
+        let render = tokio::spawn(async move { render_pool.render(request).await });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !pid_file.is_file() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Lightpanda fixture did not start");
+
+        render.abort();
+        let _ = render.await;
+        let pid = std::fs::read_to_string(pid_file).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let still_running = std::process::Command::new("kill")
+                    .args(["-0", pid.trim()])
+                    .output()
+                    .unwrap()
+                    .status
+                    .success();
+                if !still_running {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cancelled Lightpanda process was not reaped");
+        pool.shutdown().await;
+    }
+
+    #[cfg(feature = "lightpanda")]
+    #[tokio::test]
+    async fn lightpanda_renderer_rejects_unsupported_exact_user_agent_without_spawning() {
+        let pool = BrowserPool::new(BrowserPoolConfig {
+            provider: BrowserProvider::LightpandaExecutable("/not/spawned".into()),
+            ..BrowserPoolConfig::default()
+        });
+        let request = RenderRequest {
+            url: Url::parse("https://example.test/").unwrap(),
+            timeout_ms: 1_000,
+            wait: WaitCondition::Load,
+            user_agent: Some("exact-agent".to_string()),
+            screenshot_path: None,
+        };
+
+        let error = pool.render(request).await.unwrap_err();
+        pool.shutdown().await;
+
+        assert_eq!(error.code, "use.browser.unsupported");
+        assert!(error.message.contains("user-agent"));
+    }
+
+    #[cfg(feature = "lightpanda")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn installed_lightpanda_renders_a_local_http_page_when_available() {
+        use tokio::io::AsyncWriteExt;
+
+        let Some(executable) = crate::detect_lightpanda() else {
+            return;
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: 41\r\nConnection: close\r\n\r\n<html><body>runtime fixture</body></html>",
+                )
+                .await
+                .unwrap();
+        });
+        let pool = BrowserPool::new(BrowserPoolConfig {
+            provider: BrowserProvider::LightpandaExecutable(executable),
+            ..BrowserPoolConfig::default()
+        });
+        let request = RenderRequest {
+            url: Url::parse(&format!("http://{address}/fixture")).unwrap(),
+            timeout_ms: 5_000,
+            wait: WaitCondition::Load,
+            user_agent: None,
+            screenshot_path: None,
+        };
+
+        let rendered = pool.render(request).await;
+        pool.shutdown().await;
+        server.abort();
+
+        let rendered = rendered.unwrap();
+        assert!(rendered.html.contains("runtime fixture"));
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn discovered_chrome_renders_a_network_free_page_when_available() {

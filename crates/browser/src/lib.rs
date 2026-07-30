@@ -50,6 +50,8 @@ mod test_support {
 
 #[cfg(feature = "lightpanda")]
 mod lightpanda;
+#[cfg(feature = "lightpanda")]
+mod lightpanda_renderer;
 
 #[cfg(feature = "chrome")]
 pub use chrome::{detect_chrome, ensure_chrome};

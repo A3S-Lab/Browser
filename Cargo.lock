@@ -9,7 +9,7 @@ source = "git+https://github.com/A3S-Lab/ACL?rev=6e2a6469edc0f4c61b1e588d0ace873
 
 [[package]]
 name = "a3s-use-browser"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "a3s-use-core",
  "async-trait",
@@ -30,7 +30,7 @@ dependencies = [
 
 [[package]]
 name = "a3s-use-browser-driver"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "a3s-acl",
  "a3s-use-core",
