@@ -12,7 +12,7 @@
 //!
 //! Downloaded binaries are stored under the A3S Use Browser data root.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -79,8 +79,10 @@ pub(crate) fn managed_cache_dir() -> UseResult<PathBuf> {
 /// Detect an existing Lightpanda installation.
 ///
 /// Checks:
-/// 1. `LIGHTPANDA` environment variable
+/// 1. `A3S_LIGHTPANDA_EXECUTABLE` or `LIGHTPANDA` environment variable
 /// 2. `lightpanda` command in PATH
+/// 3. The read-only cache layout used by A3S Search before Browser owned
+///    runtime installation
 ///
 /// Returns `Some(path)` if found, `None` otherwise.
 pub fn detect_lightpanda() -> Option<PathBuf> {
@@ -100,7 +102,60 @@ pub fn detect_lightpanda() -> Option<PathBuf> {
         return Some(path);
     }
 
+    // 3. Preserve discovery of runtimes installed by A3S Search releases that
+    // predate the Browser repository. This path is treated as an external
+    // system installation: Browser never updates or removes it, and new
+    // managed installs continue to require a verified receipt in the current
+    // data root.
+    if let Some(path) = legacy_cache_dir().and_then(|base| find_legacy_lightpanda(&base)) {
+        debug!(
+            "Lightpanda found in the legacy A3S Search cache: {}",
+            path.display()
+        );
+        return Some(path);
+    }
+
     None
+}
+
+fn legacy_cache_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+    let home = PathBuf::from(home);
+    home.is_absolute()
+        .then(|| home.join(".a3s").join("lightpanda"))
+}
+
+fn find_legacy_lightpanda(base: &Path) -> Option<PathBuf> {
+    let mut versions = std::fs::read_dir(base)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            !entry.file_name().to_string_lossy().starts_with('.')
+                && entry.file_type().is_ok_and(|file_type| file_type.is_dir())
+        })
+        .collect::<Vec<_>>();
+    versions.sort_by_key(|entry| std::cmp::Reverse(entry.file_name()));
+    versions
+        .into_iter()
+        .map(|entry| entry.path().join("lightpanda"))
+        .find(|path| legacy_executable(path))
+}
+
+fn legacy_executable(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 /// Look for a previously downloaded Lightpanda in the cache directory.
@@ -279,4 +334,51 @@ pub async fn download_latest_lightpanda() -> UseResult<PathBuf> {
     info!("Lightpanda installed at: {}", exe_path.display());
 
     Ok(exe_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_executable(path: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"fixture").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    #[test]
+    fn legacy_search_cache_discovery_is_bounded_and_read_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join(".a3s/lightpanda");
+        let older = cache.join("nightly-2026-01").join("lightpanda");
+        let newer = cache.join("nightly-2026-02").join("lightpanda");
+        let hidden = cache.join(".stage").join("lightpanda");
+        write_executable(&older);
+        write_executable(&newer);
+        write_executable(&hidden);
+
+        assert_eq!(find_legacy_lightpanda(&cache), Some(newer.clone()));
+        assert!(older.is_file());
+        assert!(newer.is_file());
+        assert!(hidden.is_file());
+    }
+
+    #[test]
+    fn legacy_search_cache_rejects_flat_and_non_executable_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join(".a3s/lightpanda");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join("lightpanda"), b"flat fixture").unwrap();
+        let candidate = cache.join("nightly").join("lightpanda");
+        std::fs::create_dir_all(candidate.parent().unwrap()).unwrap();
+        std::fs::write(&candidate, b"fixture").unwrap();
+        #[cfg(unix)]
+        assert_eq!(find_legacy_lightpanda(&cache), None);
+        #[cfg(not(unix))]
+        assert_eq!(find_legacy_lightpanda(&cache), Some(candidate));
+    }
 }
