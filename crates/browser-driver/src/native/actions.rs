@@ -202,7 +202,7 @@ struct DrainedEvents {
 #[allow(clippy::too_many_arguments)]
 fn launch_hash(
     opts: &LaunchOptions,
-    allowed_domains: &[String],
+    network_policy: Option<&DomainFilter>,
     plugin_init_scripts: &[String],
     enable_features: &[String],
     init_script_paths: &[String],
@@ -232,7 +232,9 @@ fn launch_hash(
     opts.webgpu.hash(&mut h);
     opts.no_xvfb.hash(&mut h);
     opts.restrict_webrtc.hash(&mut h);
-    allowed_domains.hash(&mut h);
+    network_policy
+        .map(|filter| (&filter.allowed_origins, &filter.allowed_domains))
+        .hash(&mut h);
     enable_features.hash(&mut h);
     init_script_paths.hash(&mut h);
     plugin_init_scripts.hash(&mut h);
@@ -277,6 +279,7 @@ pub struct DaemonState {
     pub backend_type: BackendType,
     pub ref_map: RefMap,
     pub domain_filter: Arc<RwLock<Option<DomainFilter>>>,
+    network_policy_error: Option<String>,
     pub event_tracker: EventTracker,
     pub session_name: Option<String>,
     pub restore_save: String,
@@ -364,6 +367,26 @@ pub struct DaemonState {
 
 impl DaemonState {
     pub fn new() -> Self {
+        let allowed_origins = env::var("AGENT_BROWSER_ALLOWED_ORIGINS")
+            .ok()
+            .map(|value| split_policy_values(&value))
+            .unwrap_or_default();
+        let allowed_domains = env::var("AGENT_BROWSER_ALLOWED_DOMAINS")
+            .ok()
+            .map(|value| split_policy_values(&value))
+            .unwrap_or_default();
+        let (domain_filter, network_policy_error) =
+            if allowed_origins.is_empty() && allowed_domains.is_empty() {
+                (None, None)
+            } else {
+                match DomainFilter::from_policy(&allowed_origins, &allowed_domains) {
+                    Ok(filter) => (Some(filter), None),
+                    Err(error) => (
+                        None,
+                        Some(format!("Invalid browser network policy: {error}")),
+                    ),
+                }
+            };
         Self {
             browser: None,
             appium: None,
@@ -371,12 +394,8 @@ impl DaemonState {
             webdriver_backend: None,
             backend_type: BackendType::Cdp,
             ref_map: RefMap::new(),
-            domain_filter: Arc::new(RwLock::new(
-                env::var("AGENT_BROWSER_ALLOWED_DOMAINS")
-                    .ok()
-                    .filter(|s| !s.trim().is_empty())
-                    .map(|s| DomainFilter::new(&s)),
-            )),
+            domain_filter: Arc::new(RwLock::new(domain_filter)),
+            network_policy_error,
             event_tracker: EventTracker::new(),
             session_name: env::var("AGENT_BROWSER_SESSION_NAME").ok(),
             restore_save: env::var("AGENT_BROWSER_RESTORE_SAVE")
@@ -1875,6 +1894,12 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         return error_response(&id, &err);
     }
 
+    if action != "launch" {
+        if let Err(error) = validate_non_launch_network_policy_fields(cmd) {
+            return error_response(&id, &error);
+        }
+    }
+
     if action == INTERNAL_DAEMON_SHUTDOWN_ACTION {
         let mut resp = match handle_close(state).await {
             Ok(data) => success_response(&id, data),
@@ -1882,6 +1907,12 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         };
         inject_lifecycle(&mut resp, state, false, false, false);
         return resp;
+    }
+
+    if action != "close" {
+        if let Some(error) = state.network_policy_error.as_deref() {
+            return error_response(&id, error);
+        }
     }
 
     if let Some(ref server) = state.stream_server {
@@ -2346,6 +2377,23 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
     resp
 }
 
+fn reject_non_launch_network_policy_fields(cmd: &Value) -> Result<(), String> {
+    if cmd.get("allowedOrigins").is_some() || cmd.get("allowedDomains").is_some() {
+        return Err(
+            "allowedOrigins and allowedDomains are launch policy; they cannot be changed by an ordinary browser command"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_non_launch_network_policy_fields(cmd: &Value) -> Result<(), String> {
+    if cmd.get("action").and_then(Value::as_str) != Some("read") {
+        return reject_non_launch_network_policy_fields(cmd);
+    }
+    crate::read::options_from_command(cmd).map(drop)
+}
+
 // ---------------------------------------------------------------------------
 // Auto-launch
 // ---------------------------------------------------------------------------
@@ -2370,6 +2418,16 @@ async fn current_allowed_domains(state: &DaemonState) -> Vec<String> {
         .await
         .as_ref()
         .map(|filter| filter.allowed_domains.clone())
+        .unwrap_or_default()
+}
+
+async fn current_allowed_origins(state: &DaemonState) -> Vec<String> {
+    state
+        .domain_filter
+        .read()
+        .await
+        .as_ref()
+        .map(|filter| filter.allowed_origins.clone())
         .unwrap_or_default()
 }
 
@@ -2406,14 +2464,7 @@ fn should_blank_existing_url(url: &str, filter: &DomainFilter) -> bool {
     if url.is_empty() || url == "about:blank" {
         return false;
     }
-    url::Url::parse(url)
-        .ok()
-        .and_then(|parsed| {
-            parsed
-                .host_str()
-                .map(|hostname| !filter.is_allowed(hostname))
-        })
-        .unwrap_or(false)
+    filter.check_url(url).is_err()
 }
 
 fn check_url_allowed_by_filter(filter: Option<&DomainFilter>, url: &str) -> Result<(), String> {
@@ -2439,11 +2490,11 @@ fn should_defer_url_until_network_controls(
     };
 
     check_url_allowed_by_filter(filter, url)?;
-    Ok(filter.is_some_and(|filter| !filter.allowed_domains.is_empty()) || handle_auth_requests)
+    Ok(filter.is_some_and(DomainFilter::is_restricted) || handle_auth_requests)
 }
 
-struct AllowedDomainsLaunchSupport<'a> {
-    allowed_domains: &'a [String],
+struct NetworkPolicyLaunchSupport<'a> {
+    restricted: bool,
     cdp_url: Option<&'a str>,
     cdp_port: Option<u64>,
     auto_connect: bool,
@@ -2454,10 +2505,10 @@ struct AllowedDomainsLaunchSupport<'a> {
     storage_state: Option<&'a str>,
 }
 
-fn ensure_allowed_domains_supported_for_launch(
-    support: AllowedDomainsLaunchSupport<'_>,
+fn ensure_network_policy_supported_for_launch(
+    support: NetworkPolicyLaunchSupport<'_>,
 ) -> Result<(), String> {
-    if support.allowed_domains.is_empty() {
+    if !support.restricted {
         return Ok(());
     }
 
@@ -2466,7 +2517,7 @@ fn ensure_allowed_domains_supported_for_launch(
         .is_some_and(|key| !key.trim().is_empty())
     {
         return Err(
-            "--allowed-domains is not supported with --restore because saved state can replay origins before agent-browser can verify they are in the allowlist"
+            "--allowed-origins/--allowed-domains are not supported with --restore because saved state can replay origins before Browser can verify the network policy"
                 .to_string(),
         );
     }
@@ -2476,28 +2527,28 @@ fn ensure_allowed_domains_supported_for_launch(
         .is_some_and(|path| !path.trim().is_empty())
     {
         return Err(
-            "--allowed-domains is not supported with --state/storageState because loading state replays saved origins"
+            "--allowed-origins/--allowed-domains are not supported with --state/storageState because loading state replays saved origins"
                 .to_string(),
         );
     }
 
     if support.cdp_url.is_some() || support.cdp_port.is_some() {
         return Err(
-            "--allowed-domains is not supported with --cdp because WebRTC containment cannot be installed before existing page scripts run"
+            "--allowed-origins/--allowed-domains are not supported with --cdp because WebRTC containment cannot be installed before existing page scripts run"
                 .to_string(),
         );
     }
 
     if support.auto_connect {
         return Err(
-            "--allowed-domains is not supported with --auto-connect because WebRTC containment cannot be installed before existing page scripts run"
+            "--allowed-origins/--allowed-domains are not supported with --auto-connect because WebRTC containment cannot be installed before existing page scripts run"
                 .to_string(),
         );
     }
 
     if support.profile.is_some() {
         return Err(
-            "--allowed-domains is not supported with --profile because Chrome may restore existing pages before network containment is installed"
+            "--allowed-origins/--allowed-domains are not supported with --profile because Chrome may restore existing pages before network containment is installed"
                 .to_string(),
         );
     }
@@ -2506,13 +2557,13 @@ fn ensure_allowed_domains_supported_for_launch(
         match provider.to_lowercase().as_str() {
             "ios" => {
                 return Err(
-                    "--allowed-domains is not supported with the iOS provider because WebRTC containment cannot be enforced"
+                    "--allowed-origins/--allowed-domains are not supported with the iOS provider because WebRTC containment cannot be enforced"
                         .to_string(),
                 );
             }
             "safari" => {
                 return Err(
-                    "--allowed-domains is not supported with the Safari provider because WebRTC containment cannot be enforced"
+                    "--allowed-origins/--allowed-domains are not supported with the Safari provider because WebRTC containment cannot be enforced"
                         .to_string(),
                 );
             }
@@ -2522,7 +2573,7 @@ fn ensure_allowed_domains_supported_for_launch(
 
     if let Some(arg) = allowed_domains_disallowed_chrome_arg(support.args) {
         return Err(format!(
-            "--allowed-domains is not supported with --args containing {} because Chrome may restore or open pages before network containment is installed",
+            "--allowed-origins/--allowed-domains are not supported with --args containing {} because Chrome may restore or open pages before network containment is installed",
             arg
         ));
     }
@@ -2531,7 +2582,7 @@ fn ensure_allowed_domains_supported_for_launch(
 }
 
 fn direct_page_allowed_domains_error() -> String {
-    "--allowed-domains is not supported with direct-page browser providers because worker and popup containment require browser-level Target auto-attach"
+    "--allowed-origins/--allowed-domains are not supported with direct-page browser providers because worker and popup containment require browser-level Target auto-attach"
         .to_string()
 }
 
@@ -2540,12 +2591,9 @@ async fn ensure_state_replay_supported_by_active_domain_filter(
     source: &str,
 ) -> Result<(), String> {
     let filter = state.domain_filter.read().await;
-    if filter
-        .as_ref()
-        .is_some_and(|filter| !filter.allowed_domains.is_empty())
-    {
+    if filter.as_ref().is_some_and(DomainFilter::is_restricted) {
         return Err(format!(
-            "--allowed-domains is not supported with {} because loading state replays saved origins",
+            "--allowed-origins/--allowed-domains are not supported with {} because loading state replays saved origins",
             source
         ));
     }
@@ -2668,13 +2716,7 @@ async fn install_network_controls_for_session(
     handle_auth_requests: bool,
 ) -> Result<(), String> {
     if let Some(filter) = filter {
-        network::install_domain_filter(
-            client,
-            session_id,
-            &filter.allowed_domains,
-            handle_auth_requests,
-        )
-        .await?;
+        network::install_domain_filter(client, session_id, filter, handle_auth_requests).await?;
     } else if handle_auth_requests {
         network::install_domain_filter_fetch(client, session_id, true).await?;
     }
@@ -2796,7 +2838,9 @@ async fn auto_launch(
     let enable_features = launch_enable_features_from_env();
     let init_script_paths = launch_init_script_paths_from_env();
     let allowed_domains = current_allowed_domains(state).await;
-    options.restrict_webrtc = !allowed_domains.is_empty();
+    let allowed_origins = current_allowed_origins(state).await;
+    let network_policy = state.domain_filter.read().await.clone();
+    options.restrict_webrtc = !allowed_origins.is_empty() || !allowed_domains.is_empty();
 
     // Extract storage_state before options is moved into BrowserManager::launch.
     let storage_state_path = options.storage_state.clone();
@@ -2818,8 +2862,8 @@ async fn auto_launch(
     write_extensions_file(&state.session_id);
 
     if let Ok(cdp) = env::var("AGENT_BROWSER_CDP") {
-        ensure_allowed_domains_supported_for_launch(AllowedDomainsLaunchSupport {
-            allowed_domains: &allowed_domains,
+        ensure_network_policy_supported_for_launch(NetworkPolicyLaunchSupport {
+            restricted: network_policy.is_some(),
             cdp_url: Some(cdp.as_str()),
             cdp_port: None,
             auto_connect: false,
@@ -2832,7 +2876,7 @@ async fn auto_launch(
         let mgr = BrowserManager::connect_cdp(&cdp).await?;
         let hash = launch_hash(
             &options,
-            &allowed_domains,
+            network_policy.as_ref(),
             &state.plugin_init_scripts,
             &enable_features,
             &init_script_paths,
@@ -2855,8 +2899,8 @@ async fn auto_launch(
     }
 
     if env::var("AGENT_BROWSER_AUTO_CONNECT").is_ok() {
-        ensure_allowed_domains_supported_for_launch(AllowedDomainsLaunchSupport {
-            allowed_domains: &allowed_domains,
+        ensure_network_policy_supported_for_launch(NetworkPolicyLaunchSupport {
+            restricted: network_policy.is_some(),
             cdp_url: None,
             cdp_port: None,
             auto_connect: true,
@@ -2868,7 +2912,7 @@ async fn auto_launch(
         })?;
         let hash = launch_hash(
             &options,
-            &allowed_domains,
+            network_policy.as_ref(),
             &state.plugin_init_scripts,
             &enable_features,
             &init_script_paths,
@@ -2896,8 +2940,8 @@ async fn auto_launch(
     // command arriving before an explicit "launch") honours the provider env.
     if let Ok(provider) = env::var("AGENT_BROWSER_PROVIDER") {
         let p = provider.to_lowercase();
-        ensure_allowed_domains_supported_for_launch(AllowedDomainsLaunchSupport {
-            allowed_domains: &allowed_domains,
+        ensure_network_policy_supported_for_launch(NetworkPolicyLaunchSupport {
+            restricted: network_policy.is_some(),
             cdp_url: None,
             cdp_port: None,
             auto_connect: false,
@@ -2910,7 +2954,7 @@ async fn auto_launch(
         // ios/safari are device providers handled via explicit launch command
         if !p.is_empty() && p != "ios" && p != "safari" {
             let conn = providers::connect_provider_with_plugins(&p, &plugins).await?;
-            if conn.direct_page && !allowed_domains.is_empty() {
+            if conn.direct_page && network_policy.is_some() {
                 if let Some(ref ps) = conn.session {
                     providers::close_provider_session_with_plugins(ps, &plugins).await;
                 }
@@ -2932,7 +2976,7 @@ async fn auto_launch(
                 Ok(mgr) => {
                     let hash = launch_hash(
                         &options,
-                        &allowed_domains,
+                        network_policy.as_ref(),
                         &state.plugin_init_scripts,
                         &enable_features,
                         &init_script_paths,
@@ -2965,8 +3009,8 @@ async fn auto_launch(
         }
     }
 
-    ensure_allowed_domains_supported_for_launch(AllowedDomainsLaunchSupport {
-        allowed_domains: &allowed_domains,
+    ensure_network_policy_supported_for_launch(NetworkPolicyLaunchSupport {
+        restricted: network_policy.is_some(),
         cdp_url: None,
         cdp_port: None,
         auto_connect: false,
@@ -2978,8 +3022,8 @@ async fn auto_launch(
     })?;
 
     apply_launch_mutator_plugins(state, &mut options, plugins).await?;
-    ensure_allowed_domains_supported_for_launch(AllowedDomainsLaunchSupport {
-        allowed_domains: &allowed_domains,
+    ensure_network_policy_supported_for_launch(NetworkPolicyLaunchSupport {
+        restricted: network_policy.is_some(),
         cdp_url: None,
         cdp_port: None,
         auto_connect: false,
@@ -2992,7 +3036,7 @@ async fn auto_launch(
     write_extensions_file_from_paths(&state.session_id, options.extensions.as_deref());
     let hash = launch_hash(
         &options,
-        &allowed_domains,
+        network_policy.as_ref(),
         &state.plugin_init_scripts,
         &enable_features,
         &init_script_paths,
@@ -3053,20 +3097,55 @@ fn string_array_from_command(cmd: &Value, key: &str) -> Option<Vec<String>> {
     })
 }
 
-fn allowed_domains_from_launch_command(cmd: &Value) -> Option<Vec<String>> {
-    let value = cmd.get("allowedDomains")?;
-    let raw_domains: Vec<&str> = match value {
-        Value::String(domains) => domains.split(',').collect(),
-        Value::Array(domains) => domains.iter().filter_map(Value::as_str).collect(),
-        _ => Vec::new(),
+fn split_policy_values(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn policy_values_from_launch_command(
+    cmd: &Value,
+    key: &str,
+) -> Result<Option<Vec<String>>, String> {
+    let Some(value) = cmd.get(key) else {
+        return Ok(None);
     };
-    Some(
-        raw_domains
+    let values = match value {
+        Value::String(values) => split_policy_values(values),
+        Value::Array(values) => values
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .ok_or_else(|| format!("'{key}' must contain only strings"))
+            })
+            .collect::<Result<Vec<_>, _>>()?
             .into_iter()
-            .map(|domain| domain.trim().to_lowercase())
-            .filter(|domain| !domain.is_empty())
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(ToString::to_string)
             .collect(),
-    )
+        _ => return Err(format!("'{key}' must be a string or array of strings")),
+    };
+    Ok(Some(values))
+}
+
+fn allowed_domains_from_launch_command(cmd: &Value) -> Result<Option<Vec<String>>, String> {
+    policy_values_from_launch_command(cmd, "allowedDomains").map(|domains| {
+        domains.map(|domains| {
+            domains
+                .into_iter()
+                .map(|domain| domain.to_ascii_lowercase())
+                .collect()
+        })
+    })
+}
+
+fn allowed_origins_from_launch_command(cmd: &Value) -> Result<Option<Vec<String>>, String> {
+    policy_values_from_launch_command(cmd, "allowedOrigins")
 }
 
 async fn apply_launch_init_scripts(
@@ -3191,8 +3270,12 @@ fn launch_options_from_env() -> LaunchOptions {
         use_real_keychain: false,
         webgpu: webgpu_from_env(),
         no_xvfb: no_xvfb_from_env(),
-        restrict_webrtc: env::var("AGENT_BROWSER_ALLOWED_DOMAINS")
-            .is_ok_and(|domains| !domains.trim().is_empty()),
+        restrict_webrtc: [
+            "AGENT_BROWSER_ALLOWED_ORIGINS",
+            "AGENT_BROWSER_ALLOWED_DOMAINS",
+        ]
+        .iter()
+        .any(|name| env::var(name).is_ok_and(|value| !value.trim().is_empty())),
     }
 }
 
@@ -3559,13 +3642,20 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         .and_then(|v| v.as_str())
         .map(String::from);
 
-    let requested_allowed_domains = allowed_domains_from_launch_command(cmd);
+    let requested_allowed_domains = allowed_domains_from_launch_command(cmd)?;
+    let requested_allowed_origins = allowed_origins_from_launch_command(cmd)?;
     let previous_domain_filter = state.domain_filter.read().await.clone();
     let existing_allowed_domains = current_allowed_domains(state).await;
+    let existing_allowed_origins = current_allowed_origins(state).await;
     let allowed_domains = requested_allowed_domains
         .clone()
         .unwrap_or(existing_allowed_domains);
-    let restrict_webrtc = !allowed_domains.is_empty();
+    let allowed_origins = requested_allowed_origins
+        .clone()
+        .unwrap_or(existing_allowed_origins);
+    let next_filter = DomainFilter::from_policy(&allowed_origins, &allowed_domains)?;
+    let next_filter = next_filter.is_restricted().then_some(next_filter);
+    let restrict_webrtc = !allowed_origins.is_empty() || !allowed_domains.is_empty();
     let restore_key = cmd
         .get("restoreKey")
         .and_then(|v| v.as_str())
@@ -3581,8 +3671,8 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         })
         .unwrap_or_default();
 
-    ensure_allowed_domains_supported_for_launch(AllowedDomainsLaunchSupport {
-        allowed_domains: &allowed_domains,
+    ensure_network_policy_supported_for_launch(NetworkPolicyLaunchSupport {
+        restricted: next_filter.is_some(),
         cdp_url,
         cdp_port,
         auto_connect,
@@ -3663,8 +3753,8 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         apply_launch_mutator_plugins(state, &mut launch_options, plugins_from_command_or_env(cmd))
             .await?;
     }
-    ensure_allowed_domains_supported_for_launch(AllowedDomainsLaunchSupport {
-        allowed_domains: &allowed_domains,
+    ensure_network_policy_supported_for_launch(NetworkPolicyLaunchSupport {
+        restricted: next_filter.is_some(),
         cdp_url,
         cdp_port,
         auto_connect,
@@ -3675,20 +3765,16 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         storage_state,
     })?;
 
-    if let Some(domains) = requested_allowed_domains {
-        let mut filter = state.domain_filter.write().await;
-        *filter = if domains.is_empty() {
-            None
-        } else {
-            Some(DomainFilter::new(&domains.join(",")))
-        };
+    if requested_allowed_domains.is_some() || requested_allowed_origins.is_some() {
+        *state.domain_filter.write().await = next_filter.clone();
+        state.network_policy_error = None;
     }
 
     let (connection_kind, connection_target) =
         launch_connection_identity(cdp_url, cdp_port, auto_connect, provider_name);
     let new_hash = launch_hash(
         &launch_options,
-        &allowed_domains,
+        next_filter.as_ref(),
         &state.plugin_init_scripts,
         &enable_features,
         &init_script_paths,
@@ -3807,7 +3893,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
                     Some(provider_plugin_launch_options_from_command(cmd)),
                 )
                 .await?;
-                if conn.direct_page && !allowed_domains.is_empty() {
+                if conn.direct_page && next_filter.is_some() {
                     if let Some(ref ps) = conn.session {
                         providers::close_provider_session_with_plugins(ps, &command_plugins).await;
                     }
@@ -4097,11 +4183,17 @@ async fn handle_url(state: &DaemonState) -> Result<Value, String> {
 
 async fn handle_read(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
     let mut options = crate::read::options_from_command(cmd)?;
-    if let Some(allowed_domains) = {
+    if let Some((allowed_origins, allowed_domains)) = {
         let df = state.domain_filter.read().await;
-        df.as_ref().map(|filter| filter.allowed_domains.clone())
+        df.as_ref().map(|filter| {
+            (
+                filter.allowed_origins.clone(),
+                filter.allowed_domains.clone(),
+            )
+        })
     } {
-        if !allowed_domains.is_empty() {
+        if !allowed_origins.is_empty() || !allowed_domains.is_empty() {
+            options.enforced_allowed_origins.push(allowed_origins);
             options.enforced_allowed_domains.push(allowed_domains);
         }
     }
@@ -9054,13 +9146,57 @@ async fn resolve_fetch_paused(
 ) {
     let session_id = &paused.session_id;
 
-    // Domain filter check (takes priority over routes and origin headers)
+    // Browser network policy check (takes priority over routes and origin headers).
+    // Every redirect is paused independently, so every hop is admitted again.
     if let Some(filter) = domain_filter {
         if let Ok(parsed) = url::Url::parse(&paused.url) {
             let scheme = parsed.scheme();
             let enforce_host = matches!(scheme, "http" | "https" | "ws" | "wss");
             if !enforce_host {
+                let method = if non_web_request_is_blocked(&paused.resource_type) {
+                    "Fetch.failRequest"
+                } else {
+                    "Fetch.continueRequest"
+                };
+                let params = if method == "Fetch.failRequest" {
+                    json!({
+                        "requestId": paused.request_id,
+                        "errorReason": "BlockedByClient"
+                    })
+                } else {
+                    json!({ "requestId": paused.request_id })
+                };
+                let _ = client
+                    .send_command(method, Some(params), Some(session_id))
+                    .await;
+                return;
+            }
+
+            if filter.check_url(&paused.url).is_err() && parsed.host_str().is_some() {
                 if paused.resource_type.eq_ignore_ascii_case("document") {
+                    let error_body = format!(
+                        "<html><body><h1>Blocked</h1><p>Navigation to {} is not allowed by the browser network policy.</p></body></html>",
+                        paused.url
+                    );
+                    let encoded = base64::Engine::encode(
+                        &base64::engine::general_purpose::STANDARD,
+                        error_body.as_bytes(),
+                    );
+                    let _ = client
+                        .send_command(
+                            "Fetch.fulfillRequest",
+                            Some(json!({
+                                "requestId": paused.request_id,
+                                "responseCode": 403,
+                                "responseHeaders": [
+                                    { "name": "Content-Type", "value": "text/html" },
+                                ],
+                                "body": encoded,
+                            })),
+                            Some(session_id),
+                        )
+                        .await;
+                } else {
                     let _ = client
                         .send_command(
                             "Fetch.failRequest",
@@ -9071,57 +9207,8 @@ async fn resolve_fetch_paused(
                             Some(session_id),
                         )
                         .await;
-                } else {
-                    let _ = client
-                        .send_command(
-                            "Fetch.continueRequest",
-                            Some(json!({ "requestId": paused.request_id })),
-                            Some(session_id),
-                        )
-                        .await;
                 }
                 return;
-            }
-
-            if let Some(hostname) = parsed.host_str() {
-                if !filter.is_allowed(hostname) {
-                    if paused.resource_type.eq_ignore_ascii_case("document") {
-                        let error_body = format!(
-                            "<html><body><h1>Blocked</h1><p>Navigation to {} is not allowed by domain filter.</p></body></html>",
-                            hostname
-                        );
-                        let encoded = base64::Engine::encode(
-                            &base64::engine::general_purpose::STANDARD,
-                            error_body.as_bytes(),
-                        );
-                        let _ = client
-                            .send_command(
-                                "Fetch.fulfillRequest",
-                                Some(json!({
-                                    "requestId": paused.request_id,
-                                    "responseCode": 403,
-                                    "responseHeaders": [
-                                        { "name": "Content-Type", "value": "text/html" },
-                                    ],
-                                    "body": encoded,
-                                })),
-                                Some(session_id),
-                            )
-                            .await;
-                    } else {
-                        let _ = client
-                            .send_command(
-                                "Fetch.failRequest",
-                                Some(json!({
-                                    "requestId": paused.request_id,
-                                    "errorReason": "BlockedByClient"
-                                })),
-                                Some(session_id),
-                            )
-                            .await;
-                    }
-                    return;
-                }
             }
         }
     }
@@ -9225,6 +9312,10 @@ async fn resolve_fetch_paused(
             )
             .await;
     }
+}
+
+fn non_web_request_is_blocked(resource_type: &str) -> bool {
+    resource_type.eq_ignore_ascii_case("document")
 }
 
 // ---------------------------------------------------------------------------
@@ -10970,6 +11061,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_read_with_exact_origin_policy_is_admitted_as_a_read_constraint() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                )
+                .await
+                .unwrap();
+        });
+
+        let mut state = DaemonState::new();
+        let cmd = json!({
+            "action": "read",
+            "id": "read-exact-origin",
+            "url": format!("http://127.0.0.1:{port}/"),
+            "allowedOrigins": [format!("http://127.0.0.1:{port}")]
+        });
+
+        let resp = execute_command(&cmd, &mut state).await;
+
+        assert_eq!(resp["success"], true, "{resp}");
+        assert_eq!(resp["data"]["content"], "ok");
+        assert!(state.browser.is_none());
+    }
+
+    #[tokio::test]
     async fn test_read_without_url_does_not_auto_launch() {
         let mut state = DaemonState::new();
         let cmd = json!({ "action": "read", "id": "read-active-tab" });
@@ -11005,7 +11129,11 @@ mod tests {
         .unwrap_err();
 
         assert!(error.contains("evil.example"), "got: {}", error);
-        assert!(error.contains("allowed domains"), "got: {}", error);
+        assert!(
+            error.contains("allowed origins or domains"),
+            "got: {}",
+            error
+        );
         assert!(state.browser.is_none());
         assert!(!state.recording_state.active);
     }
@@ -11033,7 +11161,11 @@ mod tests {
         .unwrap_err();
 
         assert!(error.contains("evil.example"), "got: {}", error);
-        assert!(error.contains("allowed domains"), "got: {}", error);
+        assert!(
+            error.contains("allowed origins or domains"),
+            "got: {}",
+            error
+        );
         assert!(state.recording_state.active);
         assert_eq!(state.recording_state.output_path, "/tmp/current.webm");
     }
@@ -11659,8 +11791,8 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
             ..Default::default()
         };
         assert_ne!(
-            launch_hash(&base, &[], &[], &[], &[], Some("chrome"), "local", None),
-            launch_hash(&no_xvfb, &[], &[], &[], &[], Some("chrome"), "local", None)
+            launch_hash(&base, None, &[], &[], &[], Some("chrome"), "local", None),
+            launch_hash(&no_xvfb, None, &[], &[], &[], Some("chrome"), "local", None)
         );
     }
 
@@ -11672,8 +11804,8 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
             ..Default::default()
         };
         assert_ne!(
-            launch_hash(&base, &[], &[], &[], &[], Some("chrome"), "local", None),
-            launch_hash(&webgpu, &[], &[], &[], &[], Some("chrome"), "local", None)
+            launch_hash(&base, None, &[], &[], &[], Some("chrome"), "local", None),
+            launch_hash(&webgpu, None, &[], &[], &[], Some("chrome"), "local", None)
         );
     }
 
@@ -11689,10 +11821,10 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
             ..Default::default()
         };
         assert_ne!(
-            launch_hash(&base, &[], &[], &[], &[], Some("chrome"), "local", None),
+            launch_hash(&base, None, &[], &[], &[], Some("chrome"), "local", None),
             launch_hash(
                 &restricted,
-                &[],
+                None,
                 &[],
                 &[],
                 &[],
@@ -11702,10 +11834,12 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
             )
         );
 
+        let example = DomainFilter::new("example.com");
+        let other = DomainFilter::new("other.example");
         assert_ne!(
             launch_hash(
                 &restricted,
-                &["example.com".to_string()],
+                Some(&example),
                 &[],
                 &[],
                 &[],
@@ -11715,7 +11849,7 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
             ),
             launch_hash(
                 &restricted,
-                &["other.example".to_string()],
+                Some(&other),
                 &[],
                 &[],
                 &[],
@@ -11732,14 +11866,95 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
             allowed_domains_from_launch_command(&json!({
                 "allowedDomains": ["Example.COM", " *.example.org "]
             })),
-            Some(vec!["example.com".to_string(), "*.example.org".to_string()])
+            Ok(Some(vec![
+                "example.com".to_string(),
+                "*.example.org".to_string()
+            ]))
         );
         assert_eq!(
             allowed_domains_from_launch_command(&json!({
                 "allowedDomains": "Example.COM, *.example.org"
             })),
-            Some(vec!["example.com".to_string(), "*.example.org".to_string()])
+            Ok(Some(vec![
+                "example.com".to_string(),
+                "*.example.org".to_string()
+            ]))
         );
+    }
+
+    #[test]
+    fn test_allowed_origins_from_launch_command_preserves_origin_syntax() {
+        assert_eq!(
+            allowed_origins_from_launch_command(&json!({
+                "allowedOrigins": ["https://Example.COM:443", " http://127.0.0.1:8080 "]
+            })),
+            Ok(Some(vec![
+                "https://Example.COM:443".to_string(),
+                "http://127.0.0.1:8080".to_string(),
+            ]))
+        );
+    }
+
+    #[test]
+    fn test_launch_network_policy_rejects_malformed_field_types() {
+        assert!(allowed_origins_from_launch_command(&json!({
+            "allowedOrigins": ["https://example.com", 7]
+        }))
+        .is_err());
+        assert!(allowed_domains_from_launch_command(&json!({
+            "allowedDomains": {"host": "example.com"}
+        }))
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn test_exact_origin_policy_rejects_unsafe_launch_modes() {
+        let guard = EnvGuard::new(&[
+            "AGENT_BROWSER_ALLOWED_ORIGINS",
+            "AGENT_BROWSER_ALLOWED_DOMAINS",
+        ]);
+        guard.remove("AGENT_BROWSER_ALLOWED_ORIGINS");
+        guard.remove("AGENT_BROWSER_ALLOWED_DOMAINS");
+
+        let mut state = DaemonState::new();
+        let error = handle_launch(
+            &json!({
+                "action": "launch",
+                "cdpUrl": "http://127.0.0.1:9222",
+                "allowedOrigins": ["https://example.com"]
+            }),
+            &mut state,
+        )
+        .await
+        .expect_err("CDP must be rejected before connection");
+
+        assert!(error.contains("--allowed-origins/--allowed-domains"));
+        assert!(error.contains("--cdp"));
+        assert!(state.domain_filter.read().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_invalid_origin_policy_fails_closed_before_launch() {
+        let guard = EnvGuard::new(&[
+            "AGENT_BROWSER_ALLOWED_ORIGINS",
+            "AGENT_BROWSER_ALLOWED_DOMAINS",
+        ]);
+        guard.remove("AGENT_BROWSER_ALLOWED_ORIGINS");
+        guard.remove("AGENT_BROWSER_ALLOWED_DOMAINS");
+
+        let mut state = DaemonState::new();
+        let error = handle_launch(
+            &json!({
+                "action": "launch",
+                "allowedOrigins": ["https://example.com/path"]
+            }),
+            &mut state,
+        )
+        .await
+        .expect_err("non-origin URL must fail closed");
+
+        assert!(error.contains("allowed origin"));
+        assert!(state.browser.is_none());
     }
 
     #[test]
@@ -12320,7 +12535,7 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
         assert_ne!(
             launch_hash(
                 &opts,
-                &[],
+                None,
                 &no_scripts,
                 &[],
                 &[],
@@ -12330,7 +12545,7 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
             ),
             launch_hash(
                 &opts,
-                &[],
+                None,
                 &plugin_scripts,
                 &[],
                 &[],
@@ -12346,13 +12561,22 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
         let opts = LaunchOptions::default();
 
         assert_ne!(
-            launch_hash(&opts, &[], &[], &[], &[], Some("chrome"), "local", None),
-            launch_hash(&opts, &[], &[], &[], &[], Some("lightpanda"), "local", None)
+            launch_hash(&opts, None, &[], &[], &[], Some("chrome"), "local", None),
+            launch_hash(
+                &opts,
+                None,
+                &[],
+                &[],
+                &[],
+                Some("lightpanda"),
+                "local",
+                None
+            )
         );
         assert_ne!(
             launch_hash(
                 &opts,
-                &[],
+                None,
                 &[],
                 &[],
                 &[],
@@ -12362,7 +12586,7 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
             ),
             launch_hash(
                 &opts,
-                &[],
+                None,
                 &[],
                 &[],
                 &[],
@@ -12374,7 +12598,7 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
         assert_ne!(
             launch_hash(
                 &opts,
-                &[],
+                None,
                 &[],
                 &[],
                 &[],
@@ -12384,7 +12608,7 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
             ),
             launch_hash(
                 &opts,
-                &[],
+                None,
                 &[],
                 &[],
                 &[],
@@ -12524,6 +12748,13 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
         assert_eq!(har["response"]["cookies"][0]["name"], "token");
         assert_eq!(har["response"]["cookies"][0]["value"], "xyz");
         assert_eq!(har["_resourceType"], "XHR");
+    }
+
+    #[test]
+    fn test_non_web_document_is_blocked_but_local_subresources_continue() {
+        assert!(non_web_request_is_blocked("Document"));
+        assert!(!non_web_request_is_blocked("Image"));
+        assert!(!non_web_request_is_blocked("Script"));
     }
 
     #[test]

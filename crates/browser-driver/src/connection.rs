@@ -494,6 +494,7 @@ pub struct DaemonOptions<'a> {
     pub restore_check_text: Option<&'a str>,
     pub restore_check_fn: Option<&'a str>,
     pub download_path: Option<&'a str>,
+    pub allowed_origins: Option<&'a [String]>,
     pub allowed_domains: Option<&'a [String]>,
     pub action_policy: Option<&'a str>,
     pub confirm_actions: Option<&'a str>,
@@ -589,6 +590,9 @@ fn apply_daemon_env(cmd: &mut Command, session: &str, opts: &DaemonOptions) {
     }
     if let Some(dp) = opts.download_path {
         cmd.env("AGENT_BROWSER_DOWNLOAD_PATH", dp);
+    }
+    if let Some(origins) = opts.allowed_origins {
+        cmd.env("AGENT_BROWSER_ALLOWED_ORIGINS", origins.join(","));
     }
     if let Some(ad) = opts.allowed_domains {
         cmd.env("AGENT_BROWSER_ALLOWED_DOMAINS", ad.join(","));
@@ -1340,6 +1344,7 @@ mod tests {
             restore_check_text: None,
             restore_check_fn: None,
             download_path: None,
+            allowed_origins: None,
             allowed_domains,
             action_policy: None,
             confirm_actions: None,

@@ -2083,6 +2083,9 @@ fn parse_read(rest: &[&str], id: &str, flags: &Flags) -> Result<Value, ParseErro
     if let Some(ref allowed_domains) = flags.allowed_domains {
         cmd["allowedDomains"] = json!(allowed_domains);
     }
+    if let Some(ref allowed_origins) = flags.allowed_origins {
+        cmd["allowedOrigins"] = json!(allowed_origins);
+    }
     Ok(cmd)
 }
 
@@ -3149,6 +3152,7 @@ mod tests {
             download_path: None,
             content_boundaries: false,
             max_output: None,
+            allowed_origins: None,
             allowed_domains: None,
             action_policy: None,
             confirm_actions: None,
@@ -3693,14 +3697,16 @@ mod tests {
     }
 
     #[test]
-    fn test_read_includes_global_headers_and_allowed_domains() {
+    fn test_read_includes_global_headers_and_network_policy() {
         let mut flags = default_flags();
         flags.headers = Some(r#"{"Authorization":"Bearer token","X-Trace":"abc"}"#.to_string());
+        flags.allowed_origins = Some(vec!["https://example.com:443".to_string()]);
         flags.allowed_domains = Some(vec!["example.com".to_string(), "*.example.org".to_string()]);
 
         let cmd = parse_command(&args("read https://example.com/docs"), &flags).unwrap();
 
         assert_eq!(cmd["action"], "read");
+        assert_eq!(cmd["allowedOrigins"], json!(["https://example.com:443"]));
         assert_eq!(cmd["headers"]["Authorization"], "Bearer token");
         assert_eq!(cmd["headers"]["X-Trace"], "abc");
         assert_eq!(

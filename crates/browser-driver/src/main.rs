@@ -92,7 +92,10 @@ fn attach_script_launch_options(launch_cmd: &mut serde_json::Value, flags: &Flag
     }
 }
 
-fn attach_allowed_domains_to_launch_command(launch_cmd: &mut serde_json::Value, flags: &Flags) {
+fn attach_network_policy_to_launch_command(launch_cmd: &mut serde_json::Value, flags: &Flags) {
+    if let Some(ref origins) = flags.allowed_origins {
+        launch_cmd["allowedOrigins"] = json!(origins);
+    }
     if let Some(ref domains) = flags.allowed_domains {
         launch_cmd["allowedDomains"] = json!(domains);
     }
@@ -202,6 +205,7 @@ fn should_send_local_launch_config(flags: &Flags) -> bool {
         || flags.color_scheme.is_some()
         || flags.download_path.is_some()
         || flags.engine.is_some()
+        || flags.allowed_origins.is_some()
         || flags.allowed_domains.is_some()
         || !flags.init_scripts.is_empty()
         || !flags.enable.is_empty()
@@ -1319,6 +1323,7 @@ fn main() {
         restore_check_text: flags.restore_check_text.as_deref(),
         restore_check_fn: flags.restore_check_fn.as_deref(),
         download_path: flags.download_path.as_deref(),
+        allowed_origins: flags.allowed_origins.as_deref(),
         allowed_domains: flags.allowed_domains.as_deref(),
         action_policy: flags.action_policy.as_deref(),
         confirm_actions: flags.confirm_actions.as_deref(),
@@ -1354,7 +1359,7 @@ fn main() {
             "autoConnect": true
         });
         attach_script_launch_options(&mut launch_cmd, &flags);
-        attach_allowed_domains_to_launch_command(&mut launch_cmd, &flags);
+        attach_network_policy_to_launch_command(&mut launch_cmd, &flags);
         attach_restore_config_to_command(&mut launch_cmd, &flags);
 
         if flags.ignore_https_errors {
@@ -1451,7 +1456,7 @@ fn main() {
 
         let mut launch_cmd = launch_cmd;
         attach_script_launch_options(&mut launch_cmd, &flags);
-        attach_allowed_domains_to_launch_command(&mut launch_cmd, &flags);
+        attach_network_policy_to_launch_command(&mut launch_cmd, &flags);
         attach_restore_config_to_command(&mut launch_cmd, &flags);
 
         if flags.ignore_https_errors {
@@ -1494,7 +1499,7 @@ fn main() {
         });
         launch_cmd["plugins"] = json!(flags.plugins.clone());
         attach_script_launch_options(&mut launch_cmd, &flags);
-        attach_allowed_domains_to_launch_command(&mut launch_cmd, &flags);
+        attach_network_policy_to_launch_command(&mut launch_cmd, &flags);
         attach_restore_config_to_command(&mut launch_cmd, &flags);
 
         if let Some(ref cs) = flags.color_scheme {
@@ -1629,7 +1634,7 @@ fn main() {
             launch_cmd["downloadPath"] = json!(dp);
         }
 
-        attach_allowed_domains_to_launch_command(&mut launch_cmd, &flags);
+        attach_network_policy_to_launch_command(&mut launch_cmd, &flags);
 
         if let Some(ref engine) = flags.engine {
             launch_cmd["engine"] = json!(engine);
@@ -1995,6 +2000,7 @@ mod tests {
         flags.color_scheme = None;
         flags.download_path = None;
         flags.engine = None;
+        flags.allowed_origins = None;
         flags.allowed_domains = None;
         flags.init_scripts.clear();
         flags.enable.clear();
@@ -2032,13 +2038,15 @@ mod tests {
     }
 
     #[test]
-    fn test_attach_allowed_domains_to_launch_command() {
+    fn test_attach_network_policy_to_launch_command() {
         let mut flags = neutral_launch_config_flags();
+        flags.allowed_origins = Some(vec!["https://example.com:443".to_string()]);
         flags.allowed_domains = Some(vec!["example.com".to_string(), "*.example.org".to_string()]);
         let mut cmd = json!({ "action": "launch" });
 
-        attach_allowed_domains_to_launch_command(&mut cmd, &flags);
+        attach_network_policy_to_launch_command(&mut cmd, &flags);
 
+        assert_eq!(cmd["allowedOrigins"], json!(["https://example.com:443"]));
         assert_eq!(
             cmd["allowedDomains"],
             json!(["example.com", "*.example.org"])
@@ -2055,6 +2063,15 @@ mod tests {
 
         flags.cdp = Some("9222".to_string());
         assert!(!should_send_local_launch_config(&flags));
+    }
+
+    #[test]
+    fn test_allowed_origins_request_local_launch_configuration() {
+        let mut flags = neutral_launch_config_flags();
+        assert!(!should_send_local_launch_config(&flags));
+
+        flags.allowed_origins = Some(vec!["https://example.com:443".to_string()]);
+        assert!(should_send_local_launch_config(&flags));
     }
 
     #[test]

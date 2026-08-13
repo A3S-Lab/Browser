@@ -60,8 +60,8 @@ jobs:
       - run: pnpm --dir crates/browser-driver/dashboard build
       - run: test -f crates/browser-driver/dashboard/out/index.html
 
-  browser-032-e2e:
-    name: Browser 0.32 regressions (${{ matrix.os }})
+  browser-040-e2e:
+    name: Browser 0.4.0 regressions (${{ matrix.os }})
     if: github.event_name != 'pull_request'
     timeout-minutes: 45
     needs: test
@@ -83,5 +83,7 @@ jobs:
         run: cargo run --locked -p a3s-use-browser --example install_chrome
       - name: Run domain-containment regressions
         run: cargo test -p a3s-use-browser-driver --locked e2e_domain_filter_blocks_ -- --ignored --test-threads=1
+      - name: Run exact-origin containment regression
+        run: cargo test -p a3s-use-browser-driver --locked e2e_exact_origin_blocks_same_host_different_port_before_request -- --ignored --test-threads=1
       - name: Run completed-page lifecycle regression
         run: cargo test -p a3s-use-browser-driver --locked e2e_wait_load_state_resolves_immediately_when_already_loaded -- --ignored --test-threads=1

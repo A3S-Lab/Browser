@@ -2477,6 +2477,99 @@ async fn e2e_save_state_cross_domain() {
 
 #[tokio::test]
 #[ignore]
+async fn e2e_exact_origin_blocks_same_host_different_port_before_request() {
+    let allowed_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let allowed_port = allowed_listener.local_addr().unwrap().port();
+    let blocked_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let blocked_port = blocked_listener.local_addr().unwrap().port();
+    let blocked_requests = Arc::new(Mutex::new(Vec::<String>::new()));
+    let blocked_requests_for_server = blocked_requests.clone();
+
+    let allowed_server = tokio::spawn(async move {
+        let (mut stream, _) = allowed_listener.accept().await.unwrap();
+        let mut buf = vec![0u8; 8192];
+        let _ = stream.read(&mut buf).await.unwrap_or(0);
+        let body = format!(
+            "<!doctype html><title>exact origin</title><h1>Exact origin ready</h1><script>fetch('http://127.0.0.1:{blocked_port}/leak').catch(() => {{}});</script><iframe src='http://127.0.0.1:{blocked_port}/frame'></iframe>"
+        );
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body,
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+        let _ = stream.flush().await;
+    });
+    let blocked_server = tokio::spawn(async move {
+        loop {
+            let accepted = tokio::time::timeout(
+                tokio::time::Duration::from_millis(750),
+                blocked_listener.accept(),
+            )
+            .await;
+            let Ok(Ok((mut stream, _))) = accepted else {
+                break;
+            };
+            let mut buf = vec![0u8; 8192];
+            let n = stream.read(&mut buf).await.unwrap_or(0);
+            blocked_requests_for_server
+                .lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(&buf[..n]).to_string());
+        }
+    });
+
+    let allowed_origin = format!("http://127.0.0.1:{allowed_port}");
+    let mut state = DaemonState::new();
+    let resp = execute_command(
+        &json!({
+            "id": "1",
+            "action": "launch",
+            "headless": true,
+            "allowedOrigins": [allowed_origin]
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({
+            "id": "2",
+            "action": "navigate",
+            "url": format!("http://127.0.0.1:{allowed_port}/")
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    assert!(
+        blocked_requests.lock().unwrap().is_empty(),
+        "same-host different-port requests escaped exact-origin containment"
+    );
+
+    let resp = execute_command(
+        &json!({
+            "id": "3",
+            "action": "navigate",
+            "url": format!("http://127.0.0.1:{blocked_port}/document")
+        }),
+        &mut state,
+    )
+    .await;
+    assert_eq!(resp["success"], false);
+    assert!(resp["error"].as_str().unwrap_or("").contains("Origin"));
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+    allowed_server.await.unwrap();
+    blocked_server.await.unwrap();
+}
+
+#[tokio::test]
+#[ignore]
 async fn e2e_domain_filter() {
     let mut state = DaemonState::new();
 

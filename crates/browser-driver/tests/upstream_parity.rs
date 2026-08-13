@@ -40,7 +40,7 @@ fn isolated_command(home: &std::path::Path) -> Command {
 }
 
 #[test]
-fn mcp_all_profile_matches_locked_upstream_tool_contract() {
+fn mcp_all_profile_preserves_locked_upstream_tool_contract() {
     let home = tempfile::tempdir().expect("create isolated home");
     let mut child = isolated_command(home.path())
         .args(["mcp", "--tools", "all"])
@@ -109,6 +109,22 @@ fn mcp_all_profile_matches_locked_upstream_tool_contract() {
     assert_eq!(tools.len(), UPSTREAM_MCP_TOOL_COUNT);
     for tool in &mut tools {
         remove_descriptions(tool);
+
+        let properties = tool
+            .pointer_mut("/inputSchema/properties")
+            .and_then(Value::as_object_mut)
+            .expect("tool input schema properties");
+        let allowed_origins = properties
+            .remove("allowedOrigins")
+            .expect("A3S exact-origin extension");
+        assert_eq!(
+            allowed_origins,
+            json!({
+                "type": "array",
+                "items": { "type": "string" }
+            }),
+            "A3S exact-origin extension changed"
+        );
     }
     let bytes = serde_json::to_vec(&tools).expect("serialize normalized MCP tools");
     assert_eq!(

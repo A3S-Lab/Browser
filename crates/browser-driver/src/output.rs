@@ -1369,6 +1369,7 @@ Options:
 Global Options:
   --json               Output metadata and content as JSON
   --headers <json>     Additional HTTP headers, such as Authorization
+  --allowed-origins <list>  Restrict read fetches and redirects to exact HTTP(S) origins
   --allowed-domains <list>  Restrict read fetches and redirects to allowed domains
   --content-boundaries Wrap read output in boundary markers
   --max-output <chars> Truncate read output to N chars
@@ -3535,6 +3536,7 @@ Options:
   --download-path <path>     Default download directory (or A3S_USE_BROWSER_DOWNLOAD_PATH)
   --content-boundaries       Wrap page output in boundary markers (or A3S_USE_BROWSER_CONTENT_BOUNDARIES)
   --max-output <chars>       Truncate page output to N chars (or A3S_USE_BROWSER_MAX_OUTPUT)
+  --allowed-origins <list>   Restrict network requests to exact scheme, host, and effective port (or A3S_USE_BROWSER_ALLOWED_ORIGINS)
   --allowed-domains <list>   Restrict network domains; rejects CDP, auto-connect, profiles, restore/state replay, direct-page providers, unsafe startup args, iOS/Safari (or A3S_USE_BROWSER_ALLOWED_DOMAINS)
   --action-policy <path>     Action policy JSON file (or A3S_USE_BROWSER_ACTION_POLICY)
   --confirm-actions <list>   Categories requiring confirmation (or A3S_USE_BROWSER_CONFIRM_ACTIONS)

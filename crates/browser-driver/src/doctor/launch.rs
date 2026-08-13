@@ -77,6 +77,7 @@ pub(super) fn check(checks: &mut Vec<Check>, opts: &DoctorOptions) {
         restore_check_text: None,
         restore_check_fn: None,
         download_path: None,
+        allowed_origins: None,
         allowed_domains: None,
         action_policy: None,
         confirm_actions: None,

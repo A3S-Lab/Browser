@@ -20,6 +20,15 @@ standard MCP tools, native CLI compatibility, daemon lifecycle, Skills, and
 Dashboard. A3S Use launches it as a sibling process so advanced automation
 state does not leak into the reusable library.
 
+Browser 0.4.0 adds request-time exact-origin containment for local Chromium
+sessions. `--allowed-origins` matches scheme, lowercase host, and effective
+port; the corresponding `http`/`ws` or `https`/`wss` authority is treated as
+one permission. Explicit `--allowed-domains` entries remain wider network-only
+exceptions. The driver checks initial navigation, every redirect, Fetch-paused
+requests, popups, workers, runtime network APIs, and `read` against the same
+policy. Launch modes that cannot install containment before page code runs are
+rejected.
+
 The repository preserves the existing `a3s-use-browser` and
 `a3s-use-browser-driver` identities. A3S Use pins an immutable repository
 revision when assembling its built-in `browser` route and release assets.

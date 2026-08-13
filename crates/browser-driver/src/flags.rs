@@ -43,6 +43,7 @@ const CONFIG_ATTRIBUTES: &[&str] = &[
     "downloadPath",
     "contentBoundaries",
     "maxOutput",
+    "allowedOrigins",
     "allowedDomains",
     "actionPolicy",
     "confirmActions",
@@ -136,6 +137,7 @@ pub struct Config {
     pub download_path: Option<String>,
     pub content_boundaries: Option<bool>,
     pub max_output: Option<usize>,
+    pub allowed_origins: Option<Vec<String>>,
     pub allowed_domains: Option<Vec<String>>,
     pub action_policy: Option<String>,
     pub confirm_actions: Option<String>,
@@ -206,6 +208,7 @@ impl Config {
             download_path: other.download_path.or(self.download_path),
             content_boundaries: other.content_boundaries.or(self.content_boundaries),
             max_output: other.max_output.or(self.max_output),
+            allowed_origins: other.allowed_origins.or(self.allowed_origins),
             allowed_domains: other.allowed_domains.or(self.allowed_domains),
             action_policy: other.action_policy.or(self.action_policy),
             confirm_actions: other.confirm_actions.or(self.confirm_actions),
@@ -486,6 +489,7 @@ fn extract_config_path(args: &[String]) -> Option<Option<String>> {
         "--color-scheme",
         "--download-path",
         "--max-output",
+        "--allowed-origins",
         "--allowed-domains",
         "--action-policy",
         "--confirm-actions",
@@ -604,6 +608,7 @@ pub struct Flags {
     pub download_path: Option<String>,
     pub content_boundaries: bool,
     pub max_output: Option<usize>,
+    pub allowed_origins: Option<Vec<String>>,
     pub allowed_domains: Option<Vec<String>>,
     pub action_policy: Option<String>,
     pub confirm_actions: Option<String>,
@@ -794,6 +799,16 @@ pub fn parse_flags(args: &[String]) -> Flags {
             .ok()
             .and_then(|s| s.parse().ok())
             .or(config.max_output),
+        allowed_origins: env::var("AGENT_BROWSER_ALLOWED_ORIGINS")
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .map(str::trim)
+                    .filter(|origin| !origin.is_empty())
+                    .map(ToString::to_string)
+                    .collect()
+            })
+            .or(config.allowed_origins),
         allowed_domains: env::var("AGENT_BROWSER_ALLOWED_DOMAINS")
             .ok()
             .map(|s| {
@@ -1154,6 +1169,18 @@ pub fn parse_flags(args: &[String]) -> Flags {
                     i += 1;
                 }
             }
+            "--allowed-origins" => {
+                if let Some(s) = args.get(i + 1) {
+                    flags.allowed_origins = Some(
+                        s.split(',')
+                            .map(str::trim)
+                            .filter(|origin| !origin.is_empty())
+                            .map(ToString::to_string)
+                            .collect(),
+                    );
+                    i += 1;
+                }
+            }
             "--action-policy" => {
                 if let Some(s) = args.get(i + 1) {
                     flags.action_policy = Some(s.clone());
@@ -1303,6 +1330,7 @@ pub fn clean_args(args: &[String]) -> Vec<String> {
         "--color-scheme",
         "--download-path",
         "--max-output",
+        "--allowed-origins",
         "--allowed-domains",
         "--action-policy",
         "--confirm-actions",
@@ -1682,6 +1710,7 @@ mod tests {
   headed = true
   session = "research"
   executable_path = "/usr/bin/chromium"
+  allowed_origins = ["https://example.com:443"]
   allowed_domains = ["example.com", "*.example.org"]
   idle_timeout = "10s"
 
@@ -1699,6 +1728,10 @@ mod tests {
         assert_eq!(config.session.as_deref(), Some("research"));
         assert_eq!(config.executable_path.as_deref(), Some("/usr/bin/chromium"));
         assert_eq!(
+            config.allowed_origins,
+            Some(vec!["https://example.com:443".to_string()])
+        );
+        assert_eq!(
             config.allowed_domains,
             Some(vec!["example.com".to_string(), "*.example.org".to_string()])
         );
@@ -1706,6 +1739,21 @@ mod tests {
         let plugin = &config.plugins.unwrap()[0];
         assert_eq!(plugin.name, "vault");
         assert_eq!(plugin.command, "a3s-vault");
+    }
+
+    #[test]
+    fn test_parse_allowed_origins_flag() {
+        let flags = parse_flags(&args(
+            "--allowed-origins https://example.com:443,http://127.0.0.1:8080 open https://example.com",
+        ));
+
+        assert_eq!(
+            flags.allowed_origins,
+            Some(vec![
+                "https://example.com:443".to_string(),
+                "http://127.0.0.1:8080".to_string(),
+            ])
+        );
     }
 
     #[test]

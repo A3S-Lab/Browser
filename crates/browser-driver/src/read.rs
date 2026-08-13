@@ -7,6 +7,8 @@ use std::error::Error;
 use std::time::Duration;
 use url::Url;
 
+use crate::native::network::DomainFilter;
+
 const DEFAULT_TIMEOUT_MS: u64 = 10_000;
 const BODY_LIMIT: usize = 2 * 1024 * 1024;
 const READ_ACCEPT: &str = "text/markdown, text/plain;q=0.9, text/html;q=0.7, */*;q=0.1";
@@ -47,8 +49,12 @@ pub struct ReadOptions {
     pub headers: HashMap<String, String>,
     /// Allowed domain patterns, using the same exact and wildcard semantics as --allowed-domains.
     pub allowed_domains: Vec<String>,
+    /// Exact HTTP(S) origins supplied by --allowed-origins.
+    pub allowed_origins: Vec<String>,
     /// Additional allowlists inherited from daemon state. URLs must match every non-empty allowlist.
     pub enforced_allowed_domains: Vec<Vec<String>>,
+    /// Exact-origin policies inherited from daemon state.
+    pub enforced_allowed_origins: Vec<Vec<String>>,
 }
 
 impl Default for ReadOptions {
@@ -62,7 +68,9 @@ impl Default for ReadOptions {
             timeout_ms: DEFAULT_TIMEOUT_MS,
             headers: HashMap::new(),
             allowed_domains: Vec::new(),
+            allowed_origins: Vec::new(),
             enforced_allowed_domains: Vec::new(),
+            enforced_allowed_origins: Vec::new(),
         }
     }
 }
@@ -105,17 +113,8 @@ pub fn options_from_command(cmd: &Value) -> Result<ReadOptions, String> {
             }
         }
     }
-    let allowed_domains = cmd
-        .get("allowedDomains")
-        .and_then(|v| v.as_array())
-        .map(|domains| {
-            domains
-                .iter()
-                .filter_map(|domain| domain.as_str())
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let allowed_domains = string_list_from_command(cmd, "allowedDomains")?;
+    let allowed_origins = string_list_from_command(cmd, "allowedOrigins")?;
 
     Ok(ReadOptions {
         raw: cmd.get("raw").and_then(|v| v.as_bool()).unwrap_or(false),
@@ -135,8 +134,28 @@ pub fn options_from_command(cmd: &Value) -> Result<ReadOptions, String> {
         timeout_ms,
         headers,
         allowed_domains,
+        allowed_origins,
         enforced_allowed_domains: Vec::new(),
+        enforced_allowed_origins: Vec::new(),
     })
+}
+
+fn string_list_from_command(cmd: &Value, key: &str) -> Result<Vec<String>, String> {
+    let Some(value) = cmd.get(key) else {
+        return Ok(Vec::new());
+    };
+    let values = value
+        .as_array()
+        .ok_or_else(|| format!("'{key}' must be an array of strings"))?;
+    values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(ToString::to_string)
+                .ok_or_else(|| format!("'{key}' must contain only strings"))
+        })
+        .collect()
 }
 
 pub fn normalize_url(raw: &str) -> Result<Url, String> {
@@ -189,11 +208,11 @@ struct LlmsLink {
 pub async fn run_read(raw_url: &str, options: ReadOptions) -> Result<Value, String> {
     let target = normalize_url(raw_url)?;
     check_allowed_url_for_options(&target, &options)?;
-    let redirect_allowed_domain_sets = allowed_domain_sets_for_options(&options);
+    let redirect_allowed_policy_sets = allowed_policy_sets_for_options(&options);
     let redirect_policy = reqwest::redirect::Policy::custom(move |attempt| {
         if attempt.previous().len() > 10 {
             attempt.error("too many redirects")
-        } else if let Err(e) = check_allowed_url_sets(attempt.url(), &redirect_allowed_domain_sets)
+        } else if let Err(e) = check_allowed_url_sets(attempt.url(), &redirect_allowed_policy_sets)
         {
             attempt.error(e)
         } else {
@@ -546,32 +565,58 @@ fn check_allowed_url(url: &Url, allowed_domains: &[String]) -> Result<(), String
     ))
 }
 
-fn allowed_domain_sets_for_options(options: &ReadOptions) -> Vec<Vec<String>> {
-    let mut sets = Vec::new();
-    if !options.allowed_domains.is_empty() {
-        sets.push(options.allowed_domains.clone());
+fn check_allowed_network_policy(
+    url: &Url,
+    allowed_origins: &[String],
+    allowed_domains: &[String],
+) -> Result<(), String> {
+    if allowed_origins.is_empty() {
+        return check_allowed_url(url, allowed_domains);
     }
-    sets.extend(
-        options
+    let filter = DomainFilter::from_policy(allowed_origins, allowed_domains)?;
+    filter.check_url(url.as_str())
+}
+
+fn allowed_policy_sets_for_options(options: &ReadOptions) -> Vec<(Vec<String>, Vec<String>)> {
+    let mut sets = Vec::new();
+    if !options.allowed_origins.is_empty() || !options.allowed_domains.is_empty() {
+        sets.push((
+            options.allowed_origins.clone(),
+            options.allowed_domains.clone(),
+        ));
+    }
+    for index in 0..options
+        .enforced_allowed_origins
+        .len()
+        .max(options.enforced_allowed_domains.len())
+    {
+        let origins = options
+            .enforced_allowed_origins
+            .get(index)
+            .cloned()
+            .unwrap_or_default();
+        let domains = options
             .enforced_allowed_domains
-            .iter()
-            .filter(|domains| !domains.is_empty())
-            .cloned(),
-    );
+            .get(index)
+            .cloned()
+            .unwrap_or_default();
+        if !origins.is_empty() || !domains.is_empty() {
+            sets.push((origins, domains));
+        }
+    }
     sets
 }
 
 fn check_allowed_url_for_options(url: &Url, options: &ReadOptions) -> Result<(), String> {
-    check_allowed_url(url, &options.allowed_domains)?;
-    for domains in &options.enforced_allowed_domains {
-        check_allowed_url(url, domains)?;
-    }
-    Ok(())
+    check_allowed_url_sets(url, &allowed_policy_sets_for_options(options))
 }
 
-fn check_allowed_url_sets(url: &Url, allowed_domain_sets: &[Vec<String>]) -> Result<(), String> {
-    for domains in allowed_domain_sets {
-        check_allowed_url(url, domains)?;
+fn check_allowed_url_sets(
+    url: &Url,
+    allowed_policy_sets: &[(Vec<String>, Vec<String>)],
+) -> Result<(), String> {
+    for (origins, domains) in allowed_policy_sets {
+        check_allowed_network_policy(url, origins, domains)?;
     }
     Ok(())
 }
@@ -580,7 +625,9 @@ pub fn check_allowed_active_url_for_options(
     raw_url: &str,
     options: &ReadOptions,
 ) -> Result<(), String> {
-    if options.allowed_domains.is_empty()
+    if options.allowed_origins.is_empty()
+        && options.allowed_domains.is_empty()
+        && options.enforced_allowed_origins.iter().all(Vec::is_empty)
         && options
             .enforced_allowed_domains
             .iter()
@@ -1329,7 +1376,7 @@ Inline [Authentication](/inline-auth) should not become a TOC item.
     }
 
     #[test]
-    fn options_from_command_includes_headers_and_allowed_domains() {
+    fn options_from_command_includes_headers_and_network_policy() {
         let cmd = json!({
             "action": "read",
             "timeout": 2500,
@@ -1337,6 +1384,7 @@ Inline [Authentication](/inline-auth) should not become a TOC item.
                 "Authorization": "Bearer token",
                 "X-Trace": "abc"
             },
+            "allowedOrigins": ["https://example.com:443"],
             "allowedDomains": ["example.com", "*.example.org"]
         });
 
@@ -1352,9 +1400,27 @@ Inline [Authentication](/inline-auth) should not become a TOC item.
             Some("abc")
         );
         assert_eq!(
+            options.allowed_origins,
+            vec!["https://example.com:443".to_string()]
+        );
+        assert_eq!(
             options.allowed_domains,
             vec!["example.com".to_string(), "*.example.org".to_string()]
         );
+    }
+
+    #[test]
+    fn options_from_command_rejects_malformed_network_policy_fields() {
+        for cmd in [
+            json!({ "action": "read", "allowedOrigins": "https://example.com" }),
+            json!({ "action": "read", "allowedDomains": ["example.com", 7] }),
+        ] {
+            let error = options_from_command(&cmd).expect_err("malformed policy must fail closed");
+            assert!(
+                error.contains("array") || error.contains("strings"),
+                "{error}"
+            );
+        }
     }
 
     #[test]
@@ -1473,6 +1539,40 @@ Inline [Authentication](/inline-auth) should not become a TOC item.
 
         assert!(err.contains("example.com"));
         assert!(err.contains("allowed domains"));
+    }
+
+    #[tokio::test]
+    async fn run_read_exact_origin_blocks_same_host_different_port_before_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let allowed_port = listener.local_addr().unwrap().port();
+        let blocked_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let blocked_port = blocked_listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0_u8; 2048];
+            let _ = stream.read(&mut buf).await.unwrap_or(0);
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{blocked_port}/leak\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+
+        let options = ReadOptions {
+            allowed_origins: vec![format!("http://127.0.0.1:{allowed_port}")],
+            ..ReadOptions::default()
+        };
+        let err = run_read(&format!("http://127.0.0.1:{allowed_port}/"), options)
+            .await
+            .unwrap_err();
+
+        assert!(err.contains(&blocked_port.to_string()), "got: {err}");
+        let accepted =
+            tokio::time::timeout(Duration::from_millis(250), blocked_listener.accept()).await;
+        assert!(
+            accepted.is_err(),
+            "blocked redirect reached the second port"
+        );
     }
 
     #[test]

@@ -1876,6 +1876,14 @@ fn tool(name: &str, title: &str, description: &str, properties: Value, required:
         }),
     );
     props.insert(
+        "allowedOrigins".to_string(),
+        json!({
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Restrict browser and read traffic to exact HTTP(S) origins. Matching secure and insecure WebSocket schemes use the same authority policy."
+        }),
+    );
+    props.insert(
         "allowedDomains".to_string(),
         json!({
             "type": "array",
@@ -3505,6 +3513,12 @@ fn append_common_global_args(
         args.push("--restore-check-fn".to_string());
         args.push(check);
     }
+    if let Some(origins) = optional_string_array(arguments, "allowedOrigins")? {
+        if !origins.is_empty() {
+            args.push("--allowed-origins".to_string());
+            args.push(origins.join(","));
+        }
+    }
     if let Some(domains) = optional_string_array(arguments, "allowedDomains")? {
         if !domains.is_empty() {
             args.push("--allowed-domains".to_string());
@@ -4082,19 +4096,28 @@ mod tests {
     }
 
     #[test]
-    fn common_global_args_include_allowed_domains() {
+    fn common_global_args_include_network_policy() {
         let mut args = Vec::new();
 
         append_common_global_args(
             &mut args,
             &json!({
+                "allowedOrigins": ["https://example.com:443"],
                 "allowedDomains": ["example.com", "*.example.org"]
             }),
             None,
         )
         .unwrap();
 
-        assert_eq!(args, vec!["--allowed-domains", "example.com,*.example.org"]);
+        assert_eq!(
+            args,
+            vec![
+                "--allowed-origins",
+                "https://example.com:443",
+                "--allowed-domains",
+                "example.com,*.example.org"
+            ]
+        );
     }
 
     #[test]
@@ -4115,6 +4138,10 @@ mod tests {
         assert_eq!(
             open["inputSchema"]["properties"]["namespace"]["type"],
             "string"
+        );
+        assert_eq!(
+            open["inputSchema"]["properties"]["allowedOrigins"]["type"],
+            "array"
         );
         assert_eq!(
             open["inputSchema"]["properties"]["allowedDomains"]["type"],

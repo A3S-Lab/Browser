@@ -1,5 +1,5 @@
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use super::cdp::client::CdpClient;
 
@@ -76,8 +76,9 @@ pub async fn set_content(client: &CdpClient, session_id: &str, html: &str) -> Re
 // Domain filter
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DomainFilter {
+    pub allowed_origins: Vec<String>,
     pub allowed_domains: Vec<String>,
 }
 
@@ -85,14 +86,43 @@ impl DomainFilter {
     pub fn new(domains: &str) -> Self {
         let allowed = parse_domain_list(domains);
         Self {
+            allowed_origins: Vec::new(),
             allowed_domains: allowed,
         }
     }
 
+    pub fn from_policy(origins: &[String], domains: &[String]) -> Result<Self, String> {
+        let allowed_origins = origins
+            .iter()
+            .map(|origin| normalize_origin(origin))
+            .collect::<Result<BTreeSet<_>, _>>()?
+            .into_iter()
+            .collect();
+        let allowed_domains = domains
+            .iter()
+            .flat_map(|domains| parse_domain_list(domains))
+            .map(|domain| validate_domain_pattern(&domain))
+            .collect::<Result<BTreeSet<_>, _>>()?
+            .into_iter()
+            .collect();
+        Ok(Self {
+            allowed_origins,
+            allowed_domains,
+        })
+    }
+
+    pub fn is_restricted(&self) -> bool {
+        !self.allowed_origins.is_empty() || !self.allowed_domains.is_empty()
+    }
+
     pub fn is_allowed(&self, hostname: &str) -> bool {
-        if self.allowed_domains.is_empty() {
+        if !self.is_restricted() {
             return true;
         }
+        self.is_domain_allowed(hostname)
+    }
+
+    fn is_domain_allowed(&self, hostname: &str) -> bool {
         let hostname = hostname.to_lowercase();
         for pattern in &self.allowed_domains {
             if let Some(suffix) = pattern.strip_prefix("*.") {
@@ -107,22 +137,73 @@ impl DomainFilter {
     }
 
     pub fn check_url(&self, url: &str) -> Result<(), String> {
-        if self.allowed_domains.is_empty() {
+        if !self.is_restricted() {
             return Ok(());
         }
         let parsed = url::Url::parse(url).map_err(|_| format!("Invalid URL: {}", url))?;
         let hostname = parsed
             .host_str()
             .ok_or_else(|| format!("No hostname in URL: {}", url))?;
-        if self.is_allowed(hostname) {
+        let origin = request_origin(&parsed)?;
+        if self.is_domain_allowed(hostname) || self.allowed_origins.binary_search(&origin).is_ok() {
             Ok(())
         } else {
             Err(format!(
-                "Domain '{}' is not in the allowed domains list",
-                hostname
+                "Origin '{}' is not in the allowed origins or domains policy",
+                origin
             ))
         }
     }
+}
+
+fn normalize_origin(input: &str) -> Result<String, String> {
+    let parsed = url::Url::parse(input)
+        .map_err(|error| format!("Invalid allowed origin '{}': {}", input, error))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(format!(
+            "Invalid allowed origin '{}': scheme must be http or https",
+            input
+        ));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(format!(
+            "Invalid allowed origin '{}': credentials are not permitted",
+            input
+        ));
+    }
+    if parsed.path() != "/" || parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(format!(
+            "Invalid allowed origin '{}': path, query, and fragment are not permitted",
+            input
+        ));
+    }
+    request_origin(&parsed)
+}
+
+fn request_origin(url: &url::Url) -> Result<String, String> {
+    let canonical_scheme = match url.scheme() {
+        "http" | "ws" => "http",
+        "https" | "wss" => "https",
+        scheme => {
+            return Err(format!(
+                "URL scheme '{}' is not subject to the browser network origin policy",
+                scheme
+            ))
+        }
+    };
+    let host = url
+        .host()
+        .ok_or_else(|| format!("No hostname in URL: {}", url))?;
+    let host = match host {
+        url::Host::Ipv6(address) => format!("[{}]", address),
+        _ => host.to_string().to_ascii_lowercase(),
+    };
+    let port = url.port().unwrap_or(match canonical_scheme {
+        "http" => 80,
+        "https" => 443,
+        _ => unreachable!("canonical scheme is closed"),
+    });
+    Ok(format!("{}://{}:{}", canonical_scheme, host, port))
 }
 
 fn parse_domain_list(input: &str) -> Vec<String> {
@@ -131,6 +212,44 @@ fn parse_domain_list(input: &str) -> Vec<String> {
         .map(|s| s.trim().to_lowercase())
         .filter(|s| !s.is_empty())
         .collect()
+}
+
+fn validate_domain_pattern(input: &str) -> Result<String, String> {
+    let (wildcard, hostname) = match input.strip_prefix("*.") {
+        Some(hostname) => (true, hostname),
+        None => (false, input),
+    };
+    if hostname.is_empty()
+        || hostname.len() > 253
+        || !hostname.is_ascii()
+        || hostname.starts_with('.')
+        || hostname.ends_with('.')
+        || hostname.split('.').any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || !label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                || !label
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                || !label
+                    .as_bytes()
+                    .last()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+        })
+    {
+        return Err(format!(
+            "Invalid allowed domain '{}': expected an ASCII hostname or leading '*.' wildcard",
+            input
+        ));
+    }
+    Ok(if wildcard {
+        format!("*.{hostname}")
+    } else {
+        hostname.to_string()
+    })
 }
 
 pub async fn sanitize_existing_pages(
@@ -142,18 +261,14 @@ pub async fn sanitize_existing_pages(
         if page.url.is_empty() || page.url == "about:blank" {
             continue;
         }
-        if let Ok(parsed) = url::Url::parse(&page.url) {
-            if let Some(hostname) = parsed.host_str() {
-                if !filter.is_allowed(hostname) {
-                    let _ = client
-                        .send_command(
-                            "Page.navigate",
-                            Some(json!({ "url": "about:blank" })),
-                            Some(&page.session_id),
-                        )
-                        .await;
-                }
-            }
+        if filter.check_url(&page.url).is_err() {
+            let _ = client
+                .send_command(
+                    "Page.navigate",
+                    Some(json!({ "url": "about:blank" })),
+                    Some(&page.session_id),
+                )
+                .await;
         }
     }
 }
@@ -161,13 +276,13 @@ pub async fn sanitize_existing_pages(
 pub async fn install_domain_filter_script(
     client: &CdpClient,
     session_id: &str,
-    allowed_domains: &[String],
+    filter: &DomainFilter,
 ) -> Result<(), String> {
-    if allowed_domains.is_empty() {
+    if !filter.is_restricted() {
         return Ok(());
     }
 
-    let script = domain_filter_script(allowed_domains);
+    let script = domain_filter_script(filter);
 
     client
         .send_command(
@@ -177,7 +292,7 @@ pub async fn install_domain_filter_script(
         )
         .await?;
 
-    install_domain_filter_runtime_script(client, session_id, allowed_domains).await?;
+    install_domain_filter_runtime_script(client, session_id, filter).await?;
 
     Ok(())
 }
@@ -185,13 +300,13 @@ pub async fn install_domain_filter_script(
 async fn install_domain_filter_runtime_script(
     client: &CdpClient,
     session_id: &str,
-    allowed_domains: &[String],
+    filter: &DomainFilter,
 ) -> Result<(), String> {
-    if allowed_domains.is_empty() {
+    if !filter.is_restricted() {
         return Ok(());
     }
 
-    let script = domain_filter_script(allowed_domains);
+    let script = domain_filter_script(filter);
     let evaluation = client
         .send_command(
             "Runtime.evaluate",
@@ -215,12 +330,16 @@ async fn install_domain_filter_runtime_script(
     Ok(())
 }
 
-fn domain_filter_script(allowed_domains: &[String]) -> String {
-    let domains_json = serde_json::to_string(allowed_domains).unwrap_or("[]".to_string());
+fn domain_filter_script(filter: &DomainFilter) -> String {
+    let origins_json =
+        serde_json::to_string(&filter.allowed_origins).unwrap_or_else(|_| "[]".to_string());
+    let domains_json =
+        serde_json::to_string(&filter.allowed_domains).unwrap_or_else(|_| "[]".to_string());
     format!(
         r#"(() => {{
-            const _allowed = {};
-            function _agentBrowserInstallDomainFilter(_allowed, _baseOverride) {{
+            const _allowedOrigins = {};
+            const _allowedDomains = {};
+            function _agentBrowserInstallDomainFilter(_allowedOrigins, _allowedDomains, _baseOverride) {{
             const _global = globalThis;
             function _securityError(message) {{
                 if (typeof DOMException === 'function') {{
@@ -232,7 +351,7 @@ fn domain_filter_script(allowed_domains: &[String]) -> String {
             }}
             function _isDomainAllowed(hostname) {{
                 hostname = hostname.toLowerCase();
-                for (const p of _allowed) {{
+                for (const p of _allowedDomains) {{
                     if (p.startsWith('*.')) {{
                         const suffix = p.slice(2);
                         if (hostname === suffix || hostname.endsWith('.' + suffix)) return true;
@@ -240,11 +359,34 @@ fn domain_filter_script(allowed_domains: &[String]) -> String {
                 }}
                 return false;
             }}
+            function _canonicalOrigin(u) {{
+                let scheme;
+                let port = u.port;
+                if (u.protocol === 'http:' || u.protocol === 'ws:') {{
+                    scheme = 'http:';
+                    if (!port) port = '80';
+                }} else if (u.protocol === 'https:' || u.protocol === 'wss:') {{
+                    scheme = 'https:';
+                    if (!port) port = '443';
+                }} else {{
+                    return null;
+                }}
+                return scheme + '//' + u.hostname.toLowerCase() + ':' + port;
+            }}
+            function _isUrlAllowed(u) {{
+                if (_isDomainAllowed(u.hostname)) return true;
+                const origin = _canonicalOrigin(u);
+                return origin !== null && _allowedOrigins.includes(origin);
+            }}
+            function _isLocalUrl(u) {{
+                return u.protocol === 'data:' || u.protocol === 'blob:';
+            }}
             const _baseHref = _baseOverride || (_global.location && _global.location.href ? _global.location.href : 'about:blank');
             function _checkedUrl(url, apiName) {{
                 const u = new URL(url, _baseHref);
-                if (['http:', 'https:', 'ws:', 'wss:'].includes(u.protocol) && !_isDomainAllowed(u.hostname)) {{
-                    throw _securityError(apiName + ' blocked: ' + u.hostname);
+                if (_isLocalUrl(u)) return u.href;
+                if (!['http:', 'https:', 'ws:', 'wss:'].includes(u.protocol) || !_isUrlAllowed(u)) {{
+                    throw _securityError(apiName + ' blocked: ' + _canonicalOrigin(u));
                 }}
                 return u.href;
             }}
@@ -255,8 +397,8 @@ fn domain_filter_script(allowed_domains: &[String]) -> String {
                 const u = new URL(url, _baseHref);
                 if (u.protocol === 'http:') u.protocol = 'ws:';
                 if (u.protocol === 'https:') u.protocol = 'wss:';
-                if (['ws:', 'wss:'].includes(u.protocol) && !_isDomainAllowed(u.hostname)) {{
-                    throw _securityError(apiName + ' blocked: ' + u.hostname);
+                if (!['ws:', 'wss:'].includes(u.protocol) || !_isUrlAllowed(u)) {{
+                    throw _securityError(apiName + ' blocked: ' + _canonicalOrigin(u));
                 }}
                 return u.href;
             }}
@@ -275,12 +417,14 @@ fn domain_filter_script(allowed_domains: &[String]) -> String {
                     if (u.protocol === 'blob:') {{
                         try {{
                             const inner = new URL(u.pathname);
-                            if (inner.hostname && !_isDomainAllowed(inner.hostname)) {{
-                                throw _securityError(apiName + ' blocked: ' + inner.hostname);
+                            if (inner.hostname && !_isUrlAllowed(inner)) {{
+                                throw _securityError(apiName + ' blocked: ' + _canonicalOrigin(inner));
                             }}
                         }} catch(e) {{ if (e && e.name === 'SecurityError') throw e; }}
-                    }} else if (u.hostname && !_isDomainAllowed(u.hostname)) {{
-                        throw _securityError(apiName + ' blocked: ' + u.hostname);
+                    }} else if (!['http:', 'https:', 'ws:', 'wss:'].includes(u.protocol)) {{
+                        throw _securityError(apiName + ' blocked: unsupported URL scheme');
+                    }} else if (u.hostname && !_isUrlAllowed(u)) {{
+                        throw _securityError(apiName + ' blocked: ' + _canonicalOrigin(u));
                     }}
                 }} catch(e) {{
                     if (e && e.name === 'SecurityError') throw e;
@@ -296,7 +440,7 @@ fn domain_filter_script(allowed_domains: &[String]) -> String {
                 const isModule = options && typeof options === 'object' && options.type === 'module';
                 const cacheKey = apiName + '|' + (isModule ? 'module' : 'classic') + '|' + absolute;
                 if (_workerUrlCache && _workerUrlCache.has(cacheKey)) return _workerUrlCache.get(cacheKey);
-                const installSource = '(' + _agentBrowserInstallDomainFilter.toString() + ')(' + JSON.stringify(_allowed) + ', ' + JSON.stringify(absolute) + ');\n';
+                const installSource = '(' + _agentBrowserInstallDomainFilter.toString() + ')(' + JSON.stringify(_allowedOrigins) + ', ' + JSON.stringify(_allowedDomains) + ', ' + JSON.stringify(absolute) + ');\n';
                 const source = installSource + (isModule
                     ? 'await import(' + JSON.stringify(absolute) + ');\n'
                     : 'importScripts(' + JSON.stringify(absolute) + ');\n');
@@ -426,9 +570,9 @@ fn domain_filter_script(allowed_domains: &[String]) -> String {
             _blockPeerConnection('RTCPeerConnection');
             _blockPeerConnection('webkitRTCPeerConnection');
             }}
-            _agentBrowserInstallDomainFilter(_allowed);
+            _agentBrowserInstallDomainFilter(_allowedOrigins, _allowedDomains);
         }})()"#,
-        domains_json,
+        origins_json, domains_json,
     )
 }
 
@@ -460,11 +604,11 @@ pub async fn install_domain_filter_fetch(
 pub async fn install_domain_filter(
     client: &CdpClient,
     session_id: &str,
-    allowed_domains: &[String],
+    filter: &DomainFilter,
     handle_auth_requests: bool,
 ) -> Result<(), String> {
     install_domain_filter_fetch(client, session_id, handle_auth_requests).await?;
-    install_domain_filter_script(client, session_id, allowed_domains).await?;
+    install_domain_filter_script(client, session_id, filter).await?;
     Ok(())
 }
 
@@ -695,14 +839,102 @@ mod tests {
     }
 
     #[test]
+    fn exact_origin_policy_matches_scheme_host_and_effective_port() {
+        let filter = DomainFilter::from_policy(&["https://Example.COM".to_string()], &[])
+            .expect("exact origin policy");
+
+        assert!(filter.check_url("https://example.com/path").is_ok());
+        assert!(filter.check_url("https://example.com:443/other").is_ok());
+        assert!(filter.check_url("wss://example.com/socket").is_ok());
+        assert!(filter.check_url("wss://example.com:443/socket").is_ok());
+        assert!(filter.check_url("http://example.com/").is_err());
+        assert!(filter.check_url("https://example.com:444/").is_err());
+        assert!(filter.check_url("ws://example.com/socket").is_err());
+    }
+
+    #[test]
+    fn exact_http_origin_admits_only_the_corresponding_websocket_origin() {
+        let filter = DomainFilter::from_policy(&["http://127.0.0.1:8080".to_string()], &[])
+            .expect("exact origin policy");
+
+        assert!(filter.check_url("http://127.0.0.1:8080/").is_ok());
+        assert!(filter.check_url("ws://127.0.0.1:8080/socket").is_ok());
+        assert!(filter.check_url("https://127.0.0.1:8080/").is_err());
+        assert!(filter.check_url("http://127.0.0.1/").is_err());
+    }
+
+    #[test]
+    fn domain_exceptions_are_a_union_with_exact_origins() {
+        let filter = DomainFilter::from_policy(
+            &["https://app.example.test:8443".to_string()],
+            &["*.cdn.example.test".to_string()],
+        )
+        .expect("combined policy");
+
+        assert!(filter
+            .check_url("https://app.example.test:8443/dashboard")
+            .is_ok());
+        assert!(filter
+            .check_url("http://assets.cdn.example.test:9000/a.js")
+            .is_ok());
+        assert!(filter.check_url("https://app.example.test/").is_err());
+        assert!(filter.check_url("https://unrelated.example.test/").is_err());
+    }
+
+    #[test]
+    fn exact_origin_policy_rejects_non_origin_urls() {
+        for invalid in [
+            "ftp://example.com",
+            "https://user@example.com",
+            "https://example.com/path",
+            "https://example.com?query=1",
+            "https://example.com#fragment",
+        ] {
+            let error = DomainFilter::from_policy(&[invalid.to_string()], &[])
+                .expect_err("invalid origin must fail closed");
+            assert!(
+                error.contains("origin"),
+                "unexpected error for {invalid}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_origin_policy_canonicalizes_ipv6_and_default_ports() {
+        let filter = DomainFilter::from_policy(
+            &[
+                "HTTPS://EXAMPLE.COM:443".to_string(),
+                "http://[::1]:80".to_string(),
+            ],
+            &[],
+        )
+        .expect("canonical origins");
+
+        assert_eq!(
+            filter.allowed_origins,
+            vec!["http://[::1]:80", "https://example.com:443"]
+        );
+        assert!(filter.check_url("http://[::1]/").is_ok());
+    }
+
+    #[test]
     fn test_parse_domain_list() {
         let domains = parse_domain_list("A.com, B.com , *.C.com");
         assert_eq!(domains, vec!["a.com", "b.com", "*.c.com"]);
     }
 
     #[test]
+    fn network_policy_rejects_malformed_domain_patterns() {
+        for invalid in ["https://example.com", "example.com:443", "*.bad..host"] {
+            let error = DomainFilter::from_policy(&[], &[invalid.to_string()])
+                .expect_err("malformed domain must fail closed");
+            assert!(error.contains("allowed domain"), "{error}");
+        }
+    }
+
+    #[test]
     fn test_domain_filter_script_blocks_peer_connection_constructors() {
-        let script = domain_filter_script(&["example.com".to_string()]);
+        let script = domain_filter_script(&DomainFilter::new("example.com"));
         assert!(script.contains("_blockPeerConnection('RTCPeerConnection')"));
         assert!(script.contains("_blockPeerConnection('webkitRTCPeerConnection')"));
         assert!(script.contains("RTCPeerConnection blocked while domain filtering is active"));
@@ -711,13 +943,20 @@ mod tests {
 
     #[test]
     fn test_domain_filter_script_fails_closed_when_worker_blob_is_csp_blocked() {
-        let script = domain_filter_script(&["example.com".to_string()]);
+        let script = domain_filter_script(&DomainFilter::new("example.com"));
         assert!(script.contains("createObjectURL(new Blob"));
         assert!(script.contains("'await import(' + JSON.stringify(absolute)"));
         assert!(script.contains("const worker = new OrigCtor(bootstrapUrl, options)"));
         assert!(script.contains("return worker"));
         assert!(!script.contains("_wrapWorkerWithCspFallback"));
         assert!(!script.contains("return new OrigCtor(checkedUrl, options)"));
+    }
+
+    #[test]
+    fn test_domain_filter_script_allows_non_network_data_and_blob_resources() {
+        let script = domain_filter_script(&DomainFilter::new("example.com"));
+        assert!(script.contains("u.protocol === 'data:' || u.protocol === 'blob:'"));
+        assert!(script.contains("if (_isLocalUrl(u)) return u.href"));
     }
 
     #[test]
