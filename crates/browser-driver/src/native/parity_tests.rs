@@ -7,7 +7,10 @@
 
 use serde_json::{json, Value};
 
-use super::actions::{execute_command, DaemonState};
+use super::actions::{
+    described_node_is_oopif, download_event_matches_session, execute_command, find_frame_id,
+    frame_id_from_described_node, DaemonState,
+};
 
 const ENCRYPTION_KEY_ENV: &str = "AGENT_BROWSER_ENCRYPTION_KEY";
 
@@ -653,6 +656,97 @@ async fn test_frame_context_management() {
     // Clearing the frame ID (what mainframe does)
     state.active_frame_id = None;
     assert!(state.active_frame_id.is_none());
+}
+
+#[test]
+fn test_anonymous_cross_site_frame_resolves_by_url() {
+    let tree = json!({
+        "frame": {
+            "id": "main-frame",
+            "name": "",
+            "url": "http://127.0.0.1:4180/"
+        },
+        "childFrames": [{
+            "frame": {
+                "id": "office-frame",
+                "name": "",
+                "url": "http://localhost:4180/workspace/office?a3sWorkspaceGeneration=1"
+            }
+        }]
+    });
+
+    assert_eq!(
+        find_frame_id(
+            &tree,
+            None,
+            Some("http://localhost:4180/workspace/office?a3sWorkspaceGeneration=1"),
+        )
+        .as_deref(),
+        Some("office-frame")
+    );
+}
+
+#[test]
+fn test_described_frame_owner_resolves_same_process_and_oopif_ids() {
+    let same_process = json!({
+        "node": {
+            "nodeName": "IFRAME",
+            "contentDocument": { "frameId": "same-process-frame" }
+        }
+    });
+    let oopif = json!({
+        "node": {
+            "nodeName": "IFRAME",
+            "frameId": "oopif-frame"
+        }
+    });
+
+    assert_eq!(
+        frame_id_from_described_node(&same_process).as_deref(),
+        Some("same-process-frame")
+    );
+    assert_eq!(
+        frame_id_from_described_node(&oopif).as_deref(),
+        Some("oopif-frame")
+    );
+    assert!(!described_node_is_oopif(&same_process));
+    assert!(described_node_is_oopif(&oopif));
+    assert_eq!(
+        frame_id_from_described_node(&json!({
+            "node": { "nodeName": "DIV", "frameId": "not-a-frame" }
+        })),
+        None
+    );
+}
+
+#[test]
+fn test_download_accepts_events_from_the_selected_oopif_session() {
+    let expected = std::collections::HashSet::from([
+        "main-session".to_string(),
+        "office-oopif-session".to_string(),
+    ]);
+
+    assert!(download_event_matches_session(
+        "Browser.downloadProgress",
+        "Browser.downloadProgress",
+        "Page.downloadProgress",
+        None,
+        &expected,
+    ));
+    assert!(download_event_matches_session(
+        "Page.downloadProgress",
+        "Browser.downloadProgress",
+        "Page.downloadProgress",
+        Some("office-oopif-session"),
+        &expected,
+    ));
+    assert!(!download_event_matches_session(
+        "Page.downloadProgress",
+        "Browser.downloadProgress",
+        "Page.downloadProgress",
+        Some("unrelated-tab-session"),
+        &expected,
+    ));
 }
 
 #[test]

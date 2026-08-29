@@ -4917,7 +4917,18 @@ async fn handle_wait(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
     let timeout_ms = state.timeout_ms(cmd);
 
     if let Some(text) = cmd.get("text").and_then(|v| v.as_str()) {
-        wait_for_text(&mgr.client, &session_id, text, timeout_ms).await?;
+        match state.active_frame_id.as_deref() {
+            Some(frame_id) => match state.iframe_sessions.get(frame_id) {
+                Some(frame_session) => {
+                    wait_for_text(&mgr.client, frame_session, text, timeout_ms).await?
+                }
+                None => {
+                    wait_for_text_in_frame(&mgr.client, &session_id, frame_id, text, timeout_ms)
+                        .await?
+                }
+            },
+            None => wait_for_text(&mgr.client, &session_id, text, timeout_ms).await?,
+        }
         return Ok(json!({ "waited": "text", "text": text }));
     }
 
@@ -5227,6 +5238,47 @@ async fn wait_for_text(
         serde_json::to_string(text).unwrap_or_default()
     );
     poll_until_true(client, session_id, &check_fn, timeout_ms).await
+}
+
+async fn wait_for_text_in_frame(
+    client: &super::cdp::client::CdpClient,
+    session_id: &str,
+    frame_id: &str,
+    text: &str,
+    timeout_ms: u64,
+) -> Result<(), String> {
+    let owner_object_id =
+        super::element::frame_owner_object_id(client, session_id, frame_id).await?;
+    let expected = serde_json::to_string(text).unwrap_or_default();
+    let function = format!(
+        "function() {{ const doc = this.contentDocument; return !!doc && (doc.body?.innerText || '').includes({expected}); }}",
+    );
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(timeout_ms);
+    loop {
+        let result = client
+            .send_command(
+                "Runtime.callFunctionOn",
+                Some(json!({
+                    "objectId": owner_object_id,
+                    "functionDeclaration": function,
+                    "returnByValue": true,
+                })),
+                Some(session_id),
+            )
+            .await?;
+        if result
+            .get("result")
+            .and_then(|remote| remote.get("value"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("Wait timed out after {}ms", timeout_ms));
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
 }
 
 async fn wait_for_function(
@@ -5961,6 +6013,18 @@ async fn handle_set_media(cmd: &Value, state: &DaemonState) -> Result<Value, Str
     Ok(json!({ "set": true }))
 }
 
+pub(super) fn download_event_matches_session(
+    method: &str,
+    browser_method: &str,
+    page_method: &str,
+    event_session_id: Option<&str>,
+    expected_page_sessions: &HashSet<String>,
+) -> bool {
+    method == browser_method
+        || (method == page_method
+            && event_session_id.is_some_and(|session| expected_page_sessions.contains(session)))
+}
+
 async fn handle_download(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
     let selector = cmd
         .get("selector")
@@ -6005,6 +6069,22 @@ async fn handle_download(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
 
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
+    let mut expected_page_sessions = HashSet::from([session_id.clone()]);
+    if let Some(frame_id) = state.active_frame_id.as_deref() {
+        if let Some(frame_session) = state.iframe_sessions.get(frame_id) {
+            expected_page_sessions.insert(frame_session.clone());
+        }
+    }
+    if let Some(ref_id) = super::element::parse_ref(selector) {
+        if let Some(frame_session) = state
+            .ref_map
+            .get(&ref_id)
+            .and_then(|entry| entry.frame_id.as_deref())
+            .and_then(|frame_id| state.iframe_sessions.get(frame_id))
+        {
+            expected_page_sessions.insert(frame_session.clone());
+        }
+    }
 
     // Set download behavior to save to the parent directory
     mgr.set_download_behavior(download_dir_str).await?;
@@ -6041,9 +6121,14 @@ async fn handle_download(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
                 // or with a different sessionId than the page session, so we
                 // accept them regardless. Page-domain events are matched by
                 // session to avoid cross-tab confusion.
-                let is_page_session = event.session_id.as_deref() == Some(&session_id);
                 let is_download_event = |method: &str, browser_method: &str, page_method: &str| {
-                    method == browser_method || (method == page_method && is_page_session)
+                    download_event_matches_session(
+                        method,
+                        browser_method,
+                        page_method,
+                        event.session_id.as_deref(),
+                        &expected_page_sessions,
+                    )
                 };
 
                 // Capture the GUID from downloadWillBegin
@@ -7649,6 +7734,125 @@ async fn handle_waitforfunction(cmd: &Value, state: &DaemonState) -> Result<Valu
 // Frame handlers
 // ---------------------------------------------------------------------------
 
+pub(super) fn find_frame_id(tree: &Value, name: Option<&str>, url: Option<&str>) -> Option<String> {
+    let frame = tree.get("frame")?;
+    let frame_name = frame
+        .get("name")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let frame_url = frame
+        .get("url")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let frame_id = frame.get("id").and_then(|value| value.as_str())?;
+
+    if name.is_some_and(|candidate| frame_name == candidate) {
+        return Some(frame_id.to_string());
+    }
+    if url.is_some_and(|candidate| frame_url.contains(candidate)) {
+        return Some(frame_id.to_string());
+    }
+
+    tree.get("childFrames")
+        .and_then(|value| value.as_array())
+        .and_then(|children| {
+            children
+                .iter()
+                .find_map(|child| find_frame_id(child, name, url))
+        })
+}
+
+pub(super) fn frame_id_from_described_node(describe: &Value) -> Option<String> {
+    let node = describe.get("node")?;
+    let node_name = node.get("nodeName").and_then(Value::as_str)?;
+    if node_name != "IFRAME" && node_name != "FRAME" {
+        return None;
+    }
+
+    node.get("contentDocument")
+        .and_then(|content| content.get("frameId"))
+        .and_then(Value::as_str)
+        .or_else(|| node.get("frameId").and_then(Value::as_str))
+        .map(String::from)
+}
+
+pub(super) fn described_node_is_oopif(describe: &Value) -> bool {
+    describe
+        .get("node")
+        .is_some_and(|node| node.get("contentDocument").is_none() && node.get("frameId").is_some())
+}
+
+async fn activate_described_frame(
+    state: &mut DaemonState,
+    frame_id: String,
+    label: String,
+    oopif: bool,
+) -> Result<Value, String> {
+    state.active_frame_id = Some(frame_id.clone());
+    if oopif {
+        if let Err(error) = ensure_oopif_session(state, &frame_id).await {
+            state.active_frame_id = None;
+            return Err(error);
+        }
+    }
+    Ok(json!({ "frame": label }))
+}
+
+async fn ensure_oopif_session(state: &mut DaemonState, frame_id: &str) -> Result<(), String> {
+    if state.iframe_sessions.contains_key(frame_id) {
+        return Ok(());
+    }
+    state.drain_cdp_events_background().await?;
+    if state.iframe_sessions.contains_key(frame_id) {
+        return Ok(());
+    }
+
+    let attach_result = {
+        let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+        mgr.client
+            .send_command_typed::<_, AttachToTargetResult>(
+                "Target.attachToTarget",
+                &AttachToTargetParams {
+                    target_id: frame_id.to_string(),
+                    flatten: true,
+                },
+                None,
+            )
+            .await
+    };
+    let attach = match attach_result {
+        Ok(attach) => attach,
+        Err(error) => {
+            state.drain_cdp_events_background().await?;
+            if state.iframe_sessions.contains_key(frame_id) {
+                return Ok(());
+            }
+            return Err(format!(
+                "Could not attach to cross-origin iframe session: {error}"
+            ));
+        }
+    };
+
+    let filter = state.domain_filter.read().await.clone();
+    let has_proxy_creds = state.proxy_credentials.read().await.is_some();
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    mgr.prepare_domains_pub(&attach.session_id).await?;
+    if filter.is_some() || has_proxy_creds {
+        install_network_controls_for_session(
+            &mgr.client,
+            &attach.session_id,
+            filter.as_ref(),
+            has_proxy_creds,
+        )
+        .await?;
+    }
+    mgr.resume_if_waiting_pub(&attach.session_id).await?;
+    state
+        .iframe_sessions
+        .insert(frame_id.to_string(), attach.session_id);
+    Ok(())
+}
+
 async fn handle_frame(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
     let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
@@ -7660,40 +7864,6 @@ async fn handle_frame(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
     if selector.is_none() && name.is_none() && url.is_none() {
         return Err("At least one of 'selector', 'name', or 'url' is required".to_string());
     }
-
-    let tree_result = mgr
-        .client
-        .send_command_no_params("Page.getFrameTree", Some(&session_id))
-        .await?;
-
-    fn find_frame(tree: &Value, name: Option<&str>, url: Option<&str>) -> Option<String> {
-        let frame = tree.get("frame")?;
-        let frame_name = frame.get("name").and_then(|v| v.as_str()).unwrap_or("");
-        let frame_url = frame.get("url").and_then(|v| v.as_str()).unwrap_or("");
-        let frame_id = frame.get("id").and_then(|v| v.as_str())?;
-
-        if let Some(n) = name {
-            if frame_name == n {
-                return Some(frame_id.to_string());
-            }
-        }
-        if let Some(u) = url {
-            if frame_url.contains(u) {
-                return Some(frame_id.to_string());
-            }
-        }
-
-        if let Some(children) = tree.get("childFrames").and_then(|v| v.as_array()) {
-            for child in children {
-                if let Some(id) = find_frame(child, name, url) {
-                    return Some(id);
-                }
-            }
-        }
-        None
-    }
-
-    let frame_tree = &tree_result["frameTree"];
 
     // If selector is a ref (@e1), resolve the iframe element from the ref map
     if let Some(sel) = selector {
@@ -7718,30 +7888,9 @@ async fn handle_frame(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
                 )
                 .await?;
 
-            // Verify this is an iframe/frame element
-            let node_name = describe
-                .get("node")
-                .and_then(|n| n.get("nodeName"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            if node_name != "IFRAME" && node_name != "FRAME" {
-                return Err("Ref does not point to an iframe element".to_string());
-            }
-
-            // Try contentDocument.frameId first (standard for iframes)
-            let frame_id = describe
-                .get("node")
-                .and_then(|n| n.get("contentDocument"))
-                .and_then(|cd| cd.get("frameId"))
-                .and_then(|v| v.as_str())
-                // Fallback: the node itself may carry a frameId
-                .or_else(|| {
-                    describe
-                        .get("node")
-                        .and_then(|n| n.get("frameId"))
-                        .and_then(|v| v.as_str())
-                })
-                .ok_or("Could not resolve frame ID for iframe element")?;
+            let frame_id = frame_id_from_described_node(&describe)
+                .ok_or("Ref does not point to an iframe element with a frame ID")?;
+            let oopif = described_node_is_oopif(&describe);
 
             let label = describe
                 .get("node")
@@ -7757,31 +7906,58 @@ async fn handle_frame(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
                 })
                 .unwrap_or(&ref_id);
 
-            state.active_frame_id = Some(frame_id.to_string());
-            return Ok(json!({ "frame": label }));
+            let label = label.to_string();
+            return activate_described_frame(state, frame_id, label, oopif).await;
         }
 
-        // CSS selector path
-        let js = format!(
-            r#"(() => {{
-                const el = document.querySelector({});
-                if (!el) return null;
-                if (el.tagName === 'IFRAME' || el.tagName === 'FRAME') {{
-                    return el.name || el.id || el.src || null;
-                }}
-                return null;
-            }})()"#,
-            serde_json::to_string(sel).unwrap_or_default()
-        );
-        let result = mgr.evaluate(&js, None).await?;
-        let frame_name = result.as_str().ok_or("Could not find frame for selector")?;
-        if let Some(frame_id) = find_frame(frame_tree, Some(frame_name), None) {
-            state.active_frame_id = Some(frame_id);
-            return Ok(json!({ "frame": frame_name }));
+        // Resolve the owner node directly. Page.getFrameTree omits OOPIF
+        // children on current Chromium builds, while DOM.describeNode exposes
+        // their frameId on the iframe owner itself.
+        let evaluated: Value = mgr
+            .client
+            .send_command(
+                "Runtime.evaluate",
+                Some(json!({
+                    "expression": format!(
+                        "document.querySelector({})",
+                        serde_json::to_string(sel).unwrap_or_default()
+                    ),
+                    "returnByValue": false,
+                })),
+                Some(&session_id),
+            )
+            .await?;
+        let remote = evaluated
+            .get("result")
+            .ok_or("Could not find frame for selector")?;
+        if remote.get("subtype").and_then(Value::as_str) != Some("node") {
+            return Err("Could not find frame for selector".to_string());
         }
+        let object_id = remote
+            .get("objectId")
+            .and_then(Value::as_str)
+            .ok_or("Could not find frame for selector")?;
+        let describe: Value = mgr
+            .client
+            .send_command(
+                "DOM.describeNode",
+                Some(json!({ "objectId": object_id, "depth": 1 })),
+                Some(&session_id),
+            )
+            .await?;
+        let frame_id = frame_id_from_described_node(&describe)
+            .ok_or("Selector does not point to an iframe element with a frame ID")?;
+        let oopif = described_node_is_oopif(&describe);
+        return activate_described_frame(state, frame_id, sel.to_string(), oopif).await;
     }
 
-    if let Some(frame_id) = find_frame(frame_tree, name, url) {
+    let tree_result = mgr
+        .client
+        .send_command_no_params("Page.getFrameTree", Some(&session_id))
+        .await?;
+    let frame_tree = &tree_result["frameTree"];
+
+    if let Some(frame_id) = find_frame_id(frame_tree, name, url) {
         let label = name.or(url).unwrap_or("frame");
         state.active_frame_id = Some(frame_id);
         return Ok(json!({ "frame": label }));
