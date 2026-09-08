@@ -1,5 +1,11 @@
 # A3S Browser
 
+<p align="center">
+  <strong>Language / 语言:</strong>
+  <a href="README.md">English</a> ·
+  <a href="README.zh-CN.md">中文</a>
+</p>
+
 A3S Browser is the independently maintained Browser capability used by A3S
 Use and A3S Search. One repository owns two deliberate layers:
 
